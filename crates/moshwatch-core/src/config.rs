@@ -22,13 +22,19 @@ use tracing::warn;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HealthThresholds {
+    /// Warning threshold for smoothed RTT in milliseconds.
     pub warn_rtt_ms: u64,
+    /// Critical threshold for smoothed RTT in milliseconds.
     pub critical_rtt_ms: u64,
+    /// Warning threshold for retransmit percentage over bounded windows.
     #[serde(alias = "warn_loss_pct")]
     pub warn_retransmit_pct: f64,
+    /// Critical threshold for retransmit percentage over bounded windows.
     #[serde(alias = "critical_loss_pct")]
     pub critical_retransmit_pct: f64,
+    /// Warning threshold for silence since last heard traffic, in milliseconds.
     pub warn_silence_ms: u64,
+    /// Critical threshold for silence since last heard traffic, in milliseconds.
     pub critical_silence_ms: u64,
 }
 
@@ -48,6 +54,7 @@ impl Default for HealthThresholds {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EventStreamConfig {
+    /// Heartbeat cadence for the NDJSON snapshot stream.
     pub heartbeat_ms: u64,
 }
 
@@ -62,10 +69,15 @@ impl Default for EventStreamConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistenceConfig {
+    /// Whether periodic history persistence is enabled.
     pub enabled: bool,
+    /// Sampling interval for persisted history snapshots.
     pub sample_interval_ms: u64,
+    /// Maximum day-bucket retention window for persisted history.
     pub retention_days: u64,
+    /// Hard cap for samples returned by one history query.
     pub max_query_samples: usize,
+    /// Total disk budget for persisted history files.
     pub max_disk_bytes: u64,
 }
 
@@ -84,7 +96,9 @@ impl Default for PersistenceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetricsConfig {
+    /// Optional TCP listen address for Prometheus-format metrics.
     pub listen_addr: Option<String>,
+    /// Explicit opt-in for non-loopback metrics exposure.
     pub allow_non_loopback: bool,
 }
 
@@ -100,15 +114,25 @@ impl Default for MetricsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    /// UI/API snapshot refresh cadence in milliseconds.
     pub refresh_ms: u64,
+    /// `/proc` discovery cadence in milliseconds.
     pub discovery_interval_ms: u64,
+    /// Cleanup cadence for stale sessions in milliseconds.
     pub cleanup_interval_ms: u64,
+    /// In-memory history retention window used for detail exports.
     pub history_secs: u64,
+    /// Maximum concurrently tracked sessions before eviction/rejection applies.
     pub max_tracked_sessions: usize,
+    /// Maximum history points exported in a single session-detail response.
     pub max_session_detail_points: usize,
+    /// Thresholds used for derived health classification.
     pub thresholds: HealthThresholds,
+    /// Event-stream heartbeat configuration.
     pub stream: EventStreamConfig,
+    /// Persistent history recording configuration.
     pub persistence: PersistenceConfig,
+    /// TCP metrics exposure configuration.
     pub metrics: MetricsConfig,
 }
 
@@ -259,12 +283,19 @@ impl AppConfig {
 
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
+    /// Owner-controlled runtime directory for sockets and transient state.
     pub runtime_dir: PathBuf,
+    /// Owner-controlled persistent state directory.
     pub state_dir: PathBuf,
+    /// Directory containing day-bucketed history files.
     pub history_dir: PathBuf,
+    /// Bearer token file for TCP metrics authentication.
     pub metrics_token_path: PathBuf,
+    /// Unix socket used by the instrumented server to send telemetry.
     pub telemetry_socket: PathBuf,
+    /// Unix socket used by the local HTTP API and UI.
     pub api_socket: PathBuf,
+    /// Operator configuration file path.
     pub config_path: PathBuf,
 }
 
@@ -331,6 +362,8 @@ impl RuntimePaths {
             .with_context(|| format!("create runtime dir {}", self.runtime_dir.display()))
     }
 
+    /// Ensure the persistent state and history directories exist with
+    /// owner-controlled permissions.
     pub fn ensure_state_dir(&self) -> Result<()> {
         create_secure_dir(&self.state_dir)
             .with_context(|| format!("create state dir {}", self.state_dir.display()))?;
@@ -353,6 +386,7 @@ impl RuntimePaths {
         Ok(parsed)
     }
 
+    /// Ensure the parent directory for the config file exists securely.
     pub fn ensure_config_parent(&self) -> Result<()> {
         if let Some(parent) = self.config_path.parent() {
             create_secure_dir(parent)
@@ -361,6 +395,7 @@ impl RuntimePaths {
         Ok(())
     }
 
+    /// Write a default config file only when one does not already exist.
     pub fn maybe_write_default_config(&self) -> Result<()> {
         self.ensure_config_parent()?;
         if path_exists(&self.config_path)? {

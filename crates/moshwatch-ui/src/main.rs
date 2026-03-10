@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Terminal UI for local `moshwatchd` snapshots and session controls.
+//!
+//! ## Rationale
+//! Provide a low-friction operator view over the local Unix-socket API without
+//! introducing a second source of truth or a browser dependency.
+//!
+//! ## Interpretation Notes
+//! * The UI polls the daemon's API; it is not reading daemon memory directly.
+//! * Detail sparklines show the newest points on the right.
+//! * RTT history auto-scales, while retransmit history is fixed to `0..100%`.
+//! * History spacing follows telemetry events, not uniform wall-clock buckets.
+
 use std::{
     io::{self, Stdout},
     path::{Path, PathBuf},
@@ -617,6 +629,9 @@ fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
             .rev()
             .map(|point| point.srtt_ms.unwrap_or_default().round() as u64)
             .collect::<Vec<_>>();
+        // `RenderDirection::RightToLeft` plus reversed history means the newest
+        // sample is rendered on the right edge. RTT uses auto-scaling so spikes
+        // stay visible even when absolute values are small.
         frame.render_widget(
             Sparkline::default()
                 .block(Block::default().borders(Borders::ALL).title(format!(
@@ -635,6 +650,9 @@ fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
             .rev()
             .map(|point| sparkline_point_from_pct(point.retransmit_pct_10s))
             .collect::<Vec<_>>();
+        // Retransmit uses a fixed `0..100` scale so reconnect spikes and idle
+        // periods can be compared across sessions. Missing values stay absent
+        // instead of being coerced to zero.
         frame.render_widget(
             Sparkline::default()
                 .block(Block::default().borders(Borders::ALL).title(format!(
@@ -900,6 +918,9 @@ fn health_reasons(summary: &SessionSummary, thresholds: &HealthThresholds) -> Ve
     }
 
     if reasons.is_empty() {
+        // Distinguish between "warming", "idle", and "unknown counters" so the
+        // detail panel explains whether a quiet graph means calm traffic,
+        // insufficient history, or incomplete telemetry fields.
         if !metrics.retransmit_window_10s_complete || !metrics.retransmit_window_60s_complete {
             reasons.push("RTX windows warming".to_string());
         } else if metrics.retransmit_window_10s_breakdown.transmissions_total == Some(0)
@@ -1004,6 +1025,9 @@ async fn request_json_with_method<T>(socket_path: &Path, method: &str, path: &st
 where
     T: serde::de::DeserializeOwned,
 {
+    // Speak a tiny subset of HTTP over the owner-only Unix socket so the TUI
+    // stays decoupled from daemon internals and can treat the API as the
+    // contract boundary.
     let mut stream = timeout(Duration::from_secs(2), UnixStream::connect(socket_path))
         .await
         .context("connect timed out")?

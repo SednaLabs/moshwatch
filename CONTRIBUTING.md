@@ -20,6 +20,10 @@ or general packet-analysis tool unless that expansion is explicitly requested.
 - target `main`
 - keep changes small, focused, and easy to review
 - use short imperative commit subjects, matching the existing history
+- keep public commit subjects, bodies, and inline docs free of private or
+  internal references; use GitHub issues/PRs, repo-local docs, or a neutral
+  summary instead
+- keep maintainer-only runbooks and operational notes out of the public repo
 - explain behavior changes, operator-visible output changes, and any new
   security or licensing implications in the PR description
 

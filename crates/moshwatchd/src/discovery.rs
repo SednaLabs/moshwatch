@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Best-effort `/proc` discovery for live Mosh server processes.
+//!
+//! ## Rationale
+//! Discovery keeps stock `mosh-server` sessions visible and fills endpoint
+//! metadata gaps even when verified telemetry is unavailable or delayed.
+//!
+//! ## Security Boundaries
+//! * Discovery is advisory; it does not outrank verified telemetry.
+//! * Executable path matching is part of the trust decision, not just display
+//!   filtering.
+//! * `/proc/<pid>/exe` paths may carry a ` (deleted)` suffix after in-place
+//!   upgrades and are normalized before validation.
+
 use std::{
     collections::HashMap,
     fs, io,
@@ -300,6 +313,10 @@ fn decode_ipv6(value: &str) -> Option<String> {
 fn read_started_at_unix_ms(pid: i32, boot_time_seconds: i64, ticks_per_second: u64) -> Result<i64> {
     let path = format!("/proc/{pid}/stat");
     let raw = fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    // The command field in `/proc/<pid>/stat` is wrapped in parentheses and
+    // may itself contain spaces. Find the closing `)` first so field 22
+    // (`starttime`) keeps its stable position; this timestamp underpins session
+    // IDs, PID-reuse protection, and verified-telemetry matching.
     let end = raw
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing comm terminator"))?;

@@ -1,5 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Local HTTP-over-Unix API and latest-state snapshot stream.
+//!
+//! ## Rationale
+//! Keep the UI and other local tooling on a small, dependency-free HTTP
+//! surface exposed over an owner-only Unix socket instead of adding a separate
+//! RPC protocol.
+//!
+//! ## Security Boundaries
+//! * The Unix socket is owner-only and therefore trusted differently from the
+//!   optional TCP metrics listener.
+//! * Export surfaces are intentionally bounded and return truncation metadata.
+//! * The event stream is latest-state NDJSON, not a replayable event log.
+//!
+//! ## References
+//! * `docs/design/modularisation-and-boundaries.md`
+
 use std::{
     path::PathBuf,
     sync::{
@@ -84,6 +100,10 @@ impl SnapshotHub {
         self.tx.subscribe()
     }
 
+    /// Build a heartbeat frame for idle stream periods.
+    ///
+    /// Heartbeats intentionally carry no sequence and no session payload so
+    /// clients do not mistake them for a missed snapshot.
     pub fn heartbeat_frame(&self, now_ms: i64) -> EventStreamFrame {
         EventStreamFrame {
             schema_version: API_SCHEMA_VERSION,
@@ -228,6 +248,8 @@ async fn stream_events(mut stream: UnixStream, context: AppContext) -> Result<()
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     heartbeat.tick().await;
     loop {
+        // This stream is "latest snapshot plus heartbeat", not a durable event
+        // history. Snapshot frames advance sequence numbers; heartbeats do not.
         tokio::select! {
             changed = receiver.changed() => {
                 if changed.is_err() {
@@ -290,6 +312,11 @@ async fn build_response(
             let guard = context.state.read().await;
             let export =
                 guard.export_summaries(now_ms, crate::metrics::MAX_METRICS_RENDERED_SESSIONS);
+            // The owner-only Unix socket may expose `/metrics` without bearer
+            // auth because access is already constrained by filesystem
+            // permissions. The separate TCP metrics listener always enforces a
+            // bearer token even on loopback; both routes intentionally share
+            // the same renderer.
             (
                 200,
                 render_metrics(
@@ -424,6 +451,9 @@ async fn terminate_session(
             ));
         }
     };
+    // Revalidate the process start time before signaling so a recycled PID
+    // cannot target the wrong process. These 409s are deliberate "tracked
+    // state changed underneath you" responses, not internal server faults.
     if metadata.started_at_unix_ms != summary.started_at_unix_ms {
         return Ok((
             409,

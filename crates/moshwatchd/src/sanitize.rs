@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Sanitizers for operator-facing text and persisted history samples.
+//!
+//! ## Rationale
+//! Keep display surfaces and on-disk history resilient against malformed or
+//! hostile text without silently turning obviously invalid records into
+//! trustworthy-looking data.
+//!
+//! ## Security Boundaries
+//! * Sanitization is a stability and presentation guard, not an authentication
+//!   boundary.
+//! * Some values are normalized for display, while others are rejected
+//!   entirely when exact identity matters.
+//! * Persisted history is treated as untrusted input on read.
+
 use moshwatch_core::{HistorySample, ObserverInfo, SessionKind};
 
 const ELLIPSIS: &str = "...";
@@ -17,6 +31,9 @@ pub fn sanitize_cmdline(value: String) -> String {
 }
 
 pub fn sanitize_history_sample(mut sample: HistorySample) -> Option<HistorySample> {
+    // Reject identity-bearing fields that do not survive exact bounded
+    // sanitation. Persisted history must not be "fixed up" into a different
+    // session identifier on read.
     if sample.kind != SessionKind::Instrumented {
         return None;
     }

@@ -315,6 +315,8 @@ impl HistoryStore {
     }
 
     fn prune_old_files(&self, recorded_at_unix_ms: i64) -> Result<()> {
+        // Day buckets are kept inclusively: with `retention_days = N`, retain
+        // the current day plus the previous `N - 1` buckets.
         let oldest_day = day_bucket(recorded_at_unix_ms) - self.retention_days as i64 + 1;
         let mut removed_bytes = 0u64;
         let entries = match fs::read_dir(&self.dir) {
@@ -367,9 +369,10 @@ impl HistoryStore {
         recorded_at_unix_ms: i64,
         incoming_bytes: u64,
     ) -> Result<Option<u64>> {
-        // Evict older day buckets first, but never delete the current day's file
-        // just to squeeze in one more append. When the budget is exhausted,
-        // drop the new payload explicitly and surface it through metrics.
+        // Evict older day buckets first, but never delete the current day's
+        // file just to squeeze in one more append. This means disk budget can
+        // prune more aggressively than retention, while preserving "today" as
+        // the current operator-facing record of activity.
         if incoming_bytes == 0 {
             return Ok(Some(self.current_bytes.load(Ordering::Relaxed)));
         }

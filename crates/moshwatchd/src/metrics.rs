@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Prometheus rendering and optional TCP metrics listener.
+//!
+//! The same renderer is shared by the owner-only Unix-socket `/metrics` route
+//! and the optional TCP listener. The trust model differs: Unix-socket access
+//! is filesystem-gated, while the TCP listener always requires a bearer token,
+//! even on loopback.
+
 use std::{fmt::Write as _, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
@@ -454,6 +461,9 @@ async fn handle_metrics_connection(
     observer: ObserverInfo,
     auth_token: Arc<str>,
 ) -> Result<()> {
+    // Unlike the owner-only Unix-socket API route, the TCP listener is always
+    // bearer-protected because network reachability is a broader trust
+    // boundary than local filesystem permissions.
     let request = timeout(Duration::from_secs(2), read_request_head(&mut stream))
         .await
         .context("read metrics request timed out")??;
