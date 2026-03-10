@@ -785,7 +785,7 @@ fn escape_label(value: &str) -> String {
 mod tests {
     use moshwatch_core::{
         HealthState, ObserverInfo, RetransmitWindowBreakdown, SessionKind, SessionMetrics,
-        SessionSummary,
+        SessionPeerInfo, SessionSummary,
     };
 
     use super::{extract_bearer_token, metrics_request_is_authorized, render_metrics};
@@ -816,6 +816,11 @@ mod tests {
                     bind_addr: Some("127.0.0.1".to_string()),
                     udp_port: Some(60001),
                     client_addr: Some("192.0.2.10:60001".to_string()),
+                    peer: SessionPeerInfo {
+                        current_client_addr: Some("192.0.2.10:60001".to_string()),
+                        last_client_addr: Some("192.0.2.10:60001".to_string()),
+                        ..SessionPeerInfo::default()
+                    },
                     cmdline: "mosh-server-real".to_string(),
                     metrics: SessionMetrics {
                         srtt_ms: Some(12.5),

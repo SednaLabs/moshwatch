@@ -13,6 +13,6 @@ pub use protocol::{
     API_SCHEMA_VERSION, ApiConfigResponse, ApiHistoryResponse, ApiSessionControlResponse,
     ApiSessionResponse, ApiSessionsResponse, EventStreamEvent, EventStreamFrame, HealthState,
     HistorySample, MetricPoint, RetransmitWindowBreakdown, SessionControlAction, SessionKind,
-    SessionMetrics, SessionSnapshot, SessionSummary, TelemetryEvent, TelemetryEventKind,
-    classify_health,
+    SessionMetrics, SessionPeerInfo, SessionSnapshot, SessionSummary, TelemetryEvent,
+    TelemetryEventKind, classify_health,
 };

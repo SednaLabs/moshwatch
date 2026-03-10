@@ -13,8 +13,11 @@
 //! * History spacing follows telemetry events, not uniform wall-clock buckets.
 
 use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
     io::{self, Stdout},
     path::{Path, PathBuf},
+    process,
     time::{Duration, Instant},
 };
 
@@ -41,6 +44,7 @@ use ratatui::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
+    process::Command,
     time::{timeout, timeout_at},
 };
 
@@ -72,6 +76,8 @@ struct App {
     dropped_sessions_total: u64,
     summaries: Vec<SessionSummary>,
     detail: Option<SessionSnapshot>,
+    current_session_id: Option<String>,
+    initial_selection_resolved: bool,
     selected: usize,
     pending_terminate: Option<PendingTerminate>,
     last_notice: Option<String>,
@@ -92,6 +98,8 @@ impl App {
             dropped_sessions_total: 0,
             summaries: Vec::new(),
             detail: None,
+            current_session_id: None,
+            initial_selection_resolved: false,
             selected: 0,
             pending_terminate: None,
             last_notice: None,
@@ -118,7 +126,7 @@ impl App {
         self.pending_terminate = Some(PendingTerminate {
             session_id: summary.session_id.clone(),
             pid: summary.pid,
-            label: session_label(summary),
+            label: display_session_label(summary, self.current_session_id.as_deref()),
         });
         self.last_notice = None;
         self.last_error = None;
@@ -146,21 +154,18 @@ impl App {
                 self.dropped_sessions_total = response.dropped_sessions_total;
                 self.snapshot_stale = false;
                 self.summaries = response.sessions;
+                self.current_session_id = detect_current_session_id(&self.summaries).await;
+                let (selected, initial_selection_resolved) = next_selected_index(
+                    &self.summaries,
+                    previous_id.as_deref(),
+                    self.current_session_id.as_deref(),
+                    self.selected,
+                    self.initial_selection_resolved,
+                );
+                self.selected = selected;
+                self.initial_selection_resolved = initial_selection_resolved;
                 if self.summaries.is_empty() {
-                    self.selected = 0;
                     self.detail = None;
-                } else if let Some(ref previous_id) = previous_id {
-                    if let Some(position) = self
-                        .summaries
-                        .iter()
-                        .position(|summary| &summary.session_id == previous_id)
-                    {
-                        self.selected = position;
-                    } else {
-                        self.selected = self.selected.min(self.summaries.len().saturating_sub(1));
-                    }
-                } else {
-                    self.selected = self.selected.min(self.summaries.len().saturating_sub(1));
                 }
 
                 self.detail = None;
@@ -391,25 +396,27 @@ fn draw_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
                     .udp_port
                     .map_or_else(|| "-".to_string(), |value| value.to_string()),
             ),
-            Cell::from(
-                summary
-                    .client_addr
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
-            ),
+            Cell::from(peer_state_label(
+                summary,
+                &app.thresholds,
+                app.snapshot_generated_at_unix_ms,
+            )),
             Cell::from(fmt_f64(summary.metrics.srtt_ms, "ms")),
             Cell::from(fmt_windowed_pct(
                 summary.metrics.retransmit_pct_10s,
                 summary.metrics.retransmit_window_10s_complete,
             )),
             Cell::from(fmt_u64(summary.metrics.last_heard_age_ms, "ms")),
-            Cell::from(session_label(summary)),
+            Cell::from(display_session_label(
+                summary,
+                app.current_session_id.as_deref(),
+            )),
         ])
         .style(style)
     });
 
     let header = Row::new(vec![
-        "State", "PID", "Port", "Client", "RTT", "RTX10", "Heard", "Session",
+        "State", "PID", "Port", "Peer", "RTT", "RTX10", "Heard", "Session",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -419,7 +426,7 @@ fn draw_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
             Constraint::Length(9),
             Constraint::Length(7),
             Constraint::Length(7),
-            Constraint::Length(22),
+            Constraint::Length(15),
             Constraint::Length(9),
             Constraint::Length(9),
             Constraint::Length(10),
@@ -435,7 +442,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(11),
+            Constraint::Length(13),
             Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Min(5),
@@ -462,13 +469,43 @@ fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
             .and_then(|generated_at| observed_age_ms(generated_at, summary.last_observed_unix_ms))
             .map(|value| fmt_duration_ms(Some(value)))
             .unwrap_or_else(|| "-".to_string());
+        let current_peer = summary
+            .peer
+            .current_client_addr
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let last_peer = summary
+            .peer
+            .last_client_addr
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let last_peer_seen = format_unix_age(
+            app.snapshot_generated_at_unix_ms,
+            summary.peer.last_client_seen_at_unix_ms,
+        );
+        let client_changed = format_unix_age(
+            app.snapshot_generated_at_unix_ms,
+            summary.peer.client_addr_changed_at_unix_ms,
+        );
+        let roam_text = format_client_roam(summary, app.snapshot_generated_at_unix_ms)
+            .unwrap_or_else(|| "no client roam recorded".to_string());
         let info = vec![
             Line::from(vec![
                 Span::styled("Session ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(session_label(summary)),
+                Span::raw(display_session_label(
+                    summary,
+                    app.current_session_id.as_deref(),
+                )),
                 Span::raw("  "),
                 Span::styled("Health ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(health_label(&summary.health)),
+                Span::raw("  "),
+                Span::styled("Peer ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(peer_state_label(
+                    summary,
+                    &app.thresholds,
+                    app.snapshot_generated_at_unix_ms,
+                )),
             ]),
             Line::from(vec![
                 Span::styled("Identity ", Style::default().add_modifier(Modifier::BOLD)),
@@ -486,14 +523,33 @@ fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
                         .udp_port
                         .map_or_else(|| "-".to_string(), |value| value.to_string()),
                 ),
-                Span::raw("  "),
-                Span::styled("Client ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(
-                    summary
-                        .client_addr
-                        .clone()
-                        .unwrap_or_else(|| "-".to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Current Peer ",
+                    Style::default().add_modifier(Modifier::BOLD),
                 ),
+                Span::raw(current_peer),
+                Span::raw("  "),
+                Span::styled("Last Peer ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(last_peer),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Last Peer Seen ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(last_peer_seen),
+                Span::raw("  "),
+                Span::styled(
+                    "Client Changed ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(client_changed),
+            ]),
+            Line::from(vec![
+                Span::styled("Roam ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(roam_text),
             ]),
             Line::from(vec![
                 Span::styled("RTT ", Style::default().add_modifier(Modifier::BOLD)),
@@ -809,6 +865,107 @@ fn session_label(summary: &SessionSummary) -> String {
         .unwrap_or_else(|| summary.session_id.clone())
 }
 
+fn display_session_label(summary: &SessionSummary, current_session_id: Option<&str>) -> String {
+    let label = session_label(summary);
+    if current_session_id == Some(summary.session_id.as_str()) {
+        format!("{label} [here]")
+    } else {
+        label
+    }
+}
+
+fn peer_state_label(
+    summary: &SessionSummary,
+    thresholds: &HealthThresholds,
+    snapshot_generated_at_unix_ms: Option<i64>,
+) -> String {
+    if summary.kind == SessionKind::Legacy {
+        return "legacy".to_string();
+    }
+    if summary.peer.current_client_addr.is_some() {
+        if summary
+            .metrics
+            .last_heard_age_ms
+            .is_some_and(|age| age >= thresholds.warn_silence_ms)
+        {
+            return format!(
+                "quiet {}",
+                fmt_duration_ms(summary.metrics.last_heard_age_ms),
+            );
+        }
+        return "active".to_string();
+    }
+    if summary.peer.last_client_addr.is_some() {
+        return format!(
+            "no peer {}",
+            format_unix_age(
+                snapshot_generated_at_unix_ms,
+                summary.peer.last_client_seen_at_unix_ms
+            ),
+        );
+    }
+    "no peer yet".to_string()
+}
+
+fn format_unix_age(now_unix_ms: Option<i64>, event_unix_ms: Option<i64>) -> String {
+    now_unix_ms
+        .zip(event_unix_ms)
+        .and_then(|(now, then)| observed_age_ms(now, then))
+        .map(|age| fmt_duration_ms(Some(age)))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_client_roam(
+    summary: &SessionSummary,
+    snapshot_generated_at_unix_ms: Option<i64>,
+) -> Option<String> {
+    let previous = summary.peer.previous_client_addr.as_deref()?;
+    let current = summary
+        .peer
+        .current_client_addr
+        .as_deref()
+        .or(summary.peer.last_client_addr.as_deref())?;
+    if previous == current {
+        return None;
+    }
+    let changed_age = format_unix_age(
+        snapshot_generated_at_unix_ms,
+        summary.peer.client_addr_changed_at_unix_ms,
+    );
+    Some(format!("{previous} -> {current} ({changed_age} ago)"))
+}
+
+fn next_selected_index(
+    summaries: &[SessionSummary],
+    previous_id: Option<&str>,
+    current_session_id: Option<&str>,
+    selected: usize,
+    initial_selection_resolved: bool,
+) -> (usize, bool) {
+    if summaries.is_empty() {
+        return (0, initial_selection_resolved);
+    }
+
+    if !initial_selection_resolved
+        && let Some(current_session_id) = current_session_id
+        && let Some(position) = summaries
+            .iter()
+            .position(|summary| summary.session_id == current_session_id)
+    {
+        return (position, true);
+    }
+
+    if let Some(previous_id) = previous_id
+        && let Some(position) = summaries
+            .iter()
+            .position(|summary| summary.session_id == previous_id)
+    {
+        return (position, true);
+    }
+
+    (selected.min(summaries.len().saturating_sub(1)), true)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct HistoryDiagnostics {
     shown_points: usize,
@@ -1014,6 +1171,169 @@ fn max_f64(values: impl Iterator<Item = f64>) -> Option<f64> {
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: i32,
+    parent_pid: i32,
+    started_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcClock {
+    boot_time_seconds: i64,
+    ticks_per_second: u64,
+}
+
+async fn detect_current_session_id(summaries: &[SessionSummary]) -> Option<String> {
+    let explicit_display_session_id = env::var("MOSHWATCH_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let tmux_client_pid = tmux_active_client_pid().await;
+    let current_pid = process::id() as i32;
+    let clock = read_proc_clock()?;
+    let mut cache = HashMap::new();
+    resolve_current_session_id_with_lookup(
+        summaries,
+        explicit_display_session_id.as_deref(),
+        tmux_client_pid,
+        current_pid,
+        |pid| cached_process_identity(pid, &clock, &mut cache),
+    )
+}
+
+fn resolve_current_session_id_with_lookup<F>(
+    summaries: &[SessionSummary],
+    explicit_display_session_id: Option<&str>,
+    tmux_client_pid: Option<i32>,
+    current_pid: i32,
+    mut lookup: F,
+) -> Option<String>
+where
+    F: FnMut(i32) -> Option<ProcessIdentity>,
+{
+    if let Some(display_session_id) = explicit_display_session_id
+        && let Some(session_id) = summaries.iter().find_map(|summary| {
+            (summary.display_session_id.as_deref() == Some(display_session_id))
+                .then(|| summary.session_id.clone())
+        })
+    {
+        return Some(session_id);
+    }
+
+    if let Some(tmux_client_pid) = tmux_client_pid
+        && let Some(session_id) = match_session_by_ancestry(summaries, tmux_client_pid, &mut lookup)
+    {
+        return Some(session_id);
+    }
+
+    match_session_by_ancestry(summaries, current_pid, lookup)
+}
+
+fn match_session_by_ancestry<F>(
+    summaries: &[SessionSummary],
+    start_pid: i32,
+    mut lookup: F,
+) -> Option<String>
+where
+    F: FnMut(i32) -> Option<ProcessIdentity>,
+{
+    let mut pid = Some(start_pid);
+    let mut visited = HashSet::new();
+    while let Some(current_pid) = pid {
+        if !visited.insert(current_pid) {
+            break;
+        }
+        let identity = lookup(current_pid)?;
+        if let Some(session_id) = summaries.iter().find_map(|summary| {
+            (summary.pid == identity.pid
+                && summary.started_at_unix_ms == identity.started_at_unix_ms)
+                .then(|| summary.session_id.clone())
+        }) {
+            return Some(session_id);
+        }
+        if identity.parent_pid <= 0 || identity.parent_pid == identity.pid {
+            break;
+        }
+        pid = Some(identity.parent_pid);
+    }
+    None
+}
+
+fn cached_process_identity(
+    pid: i32,
+    clock: &ProcClock,
+    cache: &mut HashMap<i32, Option<ProcessIdentity>>,
+) -> Option<ProcessIdentity> {
+    if let Some(identity) = cache.get(&pid) {
+        return *identity;
+    }
+    let identity = read_process_identity(pid, clock).ok();
+    cache.insert(pid, identity);
+    identity
+}
+
+fn read_process_identity(pid: i32, clock: &ProcClock) -> Result<ProcessIdentity> {
+    let path = format!("/proc/{pid}/stat");
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    let end = raw
+        .rfind(')')
+        .context("missing comm terminator in /proc stat")?;
+    let fields = raw[end + 2..].split_whitespace().collect::<Vec<_>>();
+    let parent_pid = fields
+        .get(1)
+        .context("missing ppid field")?
+        .parse::<i32>()
+        .context("parse parent pid")?;
+    let start_ticks = fields
+        .get(19)
+        .context("missing starttime field")?
+        .parse::<u64>()
+        .context("parse process starttime")?;
+    Ok(ProcessIdentity {
+        pid,
+        parent_pid,
+        started_at_unix_ms: clock.boot_time_seconds * 1000
+            + (start_ticks * 1000 / clock.ticks_per_second) as i64,
+    })
+}
+
+fn read_proc_clock() -> Option<ProcClock> {
+    Some(ProcClock {
+        boot_time_seconds: read_boot_time_seconds()?,
+        ticks_per_second: read_clock_ticks_per_second()?,
+    })
+}
+
+fn read_boot_time_seconds() -> Option<i64> {
+    let raw = fs::read_to_string("/proc/stat").ok()?;
+    raw.lines()
+        .find_map(|line| line.strip_prefix("btime ")?.trim().parse::<i64>().ok())
+}
+
+fn read_clock_ticks_per_second() -> Option<u64> {
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (value > 0).then_some(value as u64)
+}
+
+async fn tmux_active_client_pid() -> Option<i32> {
+    env::var_os("TMUX")?;
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "#{client_pid}"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_pid_output(&output.stdout)
+}
+
+fn parse_pid_output(stdout: &[u8]) -> Option<i32> {
+    let output = String::from_utf8_lossy(stdout);
+    let pid = output.trim().parse::<i32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
 async fn request_json<T>(socket_path: &Path, path: &str) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
@@ -1083,19 +1403,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     use ratatui::style::Color;
     use tokio::io::AsyncWriteExt;
 
     use moshwatch_core::{
         HealthState, HealthThresholds, MetricPoint, RetransmitWindowBreakdown, SessionKind,
-        SessionMetrics, SessionSnapshot, SessionSummary,
+        SessionMetrics, SessionPeerInfo, SessionSnapshot, SessionSummary,
     };
 
     use super::{
-        MAX_HTTP_RESPONSE_BYTES, fmt_duration_ms, fmt_windowed_pct, format_retransmit_window,
-        health_reasons, read_bounded_response, retransmit_color, session_label,
+        MAX_HTTP_RESPONSE_BYTES, ProcessIdentity, display_session_label, fmt_duration_ms,
+        fmt_windowed_pct, format_client_roam, format_retransmit_window, health_reasons,
+        next_selected_index, parse_pid_output, peer_state_label, read_bounded_response,
+        resolve_current_session_id_with_lookup, retransmit_color, session_label,
         sparkline_point_from_pct, summarize_history,
     };
 
@@ -1111,6 +1433,7 @@ mod tests {
             bind_addr: None,
             udp_port: None,
             client_addr: None,
+            peer: SessionPeerInfo::default(),
             cmdline: "mosh-server-real".to_string(),
             metrics: SessionMetrics::default(),
         }
@@ -1375,6 +1698,211 @@ mod tests {
         assert_eq!(
             health_reasons(&idle, &thresholds),
             vec!["RTX windows idle".to_string()]
+        );
+    }
+
+    #[test]
+    fn display_session_label_marks_current_session() {
+        let summary = summary();
+        assert_eq!(display_session_label(&summary, None), "display-1");
+        assert_eq!(
+            display_session_label(&summary, Some("instrumented:1:42")),
+            "display-1 [here]"
+        );
+    }
+
+    #[test]
+    fn peer_state_label_distinguishes_live_peer_states() {
+        let thresholds = HealthThresholds::default();
+        let active = SessionSummary {
+            peer: SessionPeerInfo {
+                current_client_addr: Some("192.0.2.10:60001".to_string()),
+                last_client_addr: Some("192.0.2.10:60001".to_string()),
+                last_client_seen_at_unix_ms: Some(9_900),
+                ..SessionPeerInfo::default()
+            },
+            metrics: SessionMetrics {
+                last_heard_age_ms: Some(100),
+                ..SessionMetrics::default()
+            },
+            ..summary()
+        };
+        assert_eq!(
+            peer_state_label(&active, &thresholds, Some(10_000)),
+            "active"
+        );
+
+        let quiet = SessionSummary {
+            metrics: SessionMetrics {
+                last_heard_age_ms: Some(6_000),
+                ..active.metrics.clone()
+            },
+            ..active.clone()
+        };
+        assert_eq!(
+            peer_state_label(&quiet, &thresholds, Some(10_000)),
+            "quiet 6.0s"
+        );
+
+        let no_peer = SessionSummary {
+            peer: SessionPeerInfo {
+                current_client_addr: None,
+                last_client_addr: Some("192.0.2.10:60001".to_string()),
+                last_client_seen_at_unix_ms: Some(4_000),
+                ..SessionPeerInfo::default()
+            },
+            ..summary()
+        };
+        assert_eq!(
+            peer_state_label(&no_peer, &thresholds, Some(10_000)),
+            "no peer 6.0s"
+        );
+
+        assert_eq!(
+            peer_state_label(&summary(), &thresholds, Some(10_000)),
+            "no peer yet"
+        );
+
+        let legacy = SessionSummary {
+            kind: SessionKind::Legacy,
+            ..summary()
+        };
+        assert_eq!(
+            peer_state_label(&legacy, &thresholds, Some(10_000)),
+            "legacy"
+        );
+    }
+
+    #[test]
+    fn format_client_roam_uses_previous_and_last_known_peer() {
+        let summary = SessionSummary {
+            peer: SessionPeerInfo {
+                last_client_addr: Some("198.51.100.20:60001".to_string()),
+                previous_client_addr: Some("198.51.100.10:60001".to_string()),
+                client_addr_changed_at_unix_ms: Some(7_000),
+                ..SessionPeerInfo::default()
+            },
+            ..summary()
+        };
+        assert_eq!(
+            format_client_roam(&summary, Some(10_000)).as_deref(),
+            Some("198.51.100.10:60001 -> 198.51.100.20:60001 (3.0s ago)")
+        );
+    }
+
+    #[test]
+    fn current_session_resolution_prefers_explicit_display_id() {
+        let first = summary();
+        let second = SessionSummary {
+            session_id: "instrumented:2:84".to_string(),
+            display_session_id: Some("display-2".to_string()),
+            pid: 84,
+            started_at_unix_ms: 2,
+            ..summary()
+        };
+        let mut processes = HashMap::new();
+        processes.insert(
+            500,
+            ProcessIdentity {
+                pid: 42,
+                parent_pid: 1,
+                started_at_unix_ms: 1,
+            },
+        );
+        let resolved = resolve_current_session_id_with_lookup(
+            &[first, second],
+            Some("display-2"),
+            None,
+            500,
+            |pid| processes.get(&pid).copied(),
+        );
+        assert_eq!(resolved.as_deref(), Some("instrumented:2:84"));
+    }
+
+    #[test]
+    fn current_session_resolution_prefers_tmux_client_ancestry_over_current_process() {
+        let first = summary();
+        let second = SessionSummary {
+            session_id: "instrumented:2:84".to_string(),
+            display_session_id: Some("display-2".to_string()),
+            pid: 84,
+            started_at_unix_ms: 2,
+            ..summary()
+        };
+        let mut processes = HashMap::new();
+        processes.insert(
+            500,
+            ProcessIdentity {
+                pid: 42,
+                parent_pid: 1,
+                started_at_unix_ms: 1,
+            },
+        );
+        processes.insert(
+            600,
+            ProcessIdentity {
+                pid: 84,
+                parent_pid: 1,
+                started_at_unix_ms: 2,
+            },
+        );
+        let resolved =
+            resolve_current_session_id_with_lookup(&[first, second], None, Some(600), 500, |pid| {
+                processes.get(&pid).copied()
+            });
+        assert_eq!(resolved.as_deref(), Some("instrumented:2:84"));
+    }
+
+    #[test]
+    fn next_selected_index_only_uses_current_session_on_first_refresh() {
+        let first = summary();
+        let second = SessionSummary {
+            session_id: "instrumented:2:84".to_string(),
+            display_session_id: Some("display-2".to_string()),
+            pid: 84,
+            started_at_unix_ms: 2,
+            ..summary()
+        };
+        let summaries = vec![first.clone(), second.clone()];
+
+        let (selected, resolved) =
+            next_selected_index(&summaries, None, Some(second.session_id.as_str()), 0, false);
+        assert_eq!(selected, 1);
+        assert!(resolved);
+
+        let (selected, resolved) = next_selected_index(
+            &summaries,
+            Some(first.session_id.as_str()),
+            Some(second.session_id.as_str()),
+            1,
+            true,
+        );
+        assert_eq!(selected, 0);
+        assert!(resolved);
+    }
+
+    #[test]
+    fn tmux_pid_parser_accepts_numeric_stdout() {
+        assert_eq!(
+            parse_pid_output(
+                b"1775720
+"
+            ),
+            Some(1_775_720)
+        );
+        assert_eq!(
+            parse_pid_output(
+                b"0
+"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_pid_output(
+                b"
+"
+            ),
+            None
         );
     }
 

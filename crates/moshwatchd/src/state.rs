@@ -13,7 +13,8 @@ use std::{
 
 use moshwatch_core::{
     AppConfig, HealthState, MetricPoint, RetransmitWindowBreakdown, SessionKind, SessionMetrics,
-    SessionSnapshot, SessionSummary, TelemetryEvent, TelemetryEventKind, classify_health,
+    SessionPeerInfo, SessionSnapshot, SessionSummary, TelemetryEvent, TelemetryEventKind,
+    classify_health,
 };
 
 use crate::{
@@ -135,7 +136,8 @@ impl ServiceState {
                     last_observed_unix_ms: initial_observed_unix_ms,
                     bind_addr: bind_addr.clone(),
                     udp_port: event.udp_port,
-                    client_addr: client_addr.clone(),
+                    client_addr: None,
+                    peer: SessionPeerInfo::default(),
                     cmdline: cmdline
                         .clone()
                         .unwrap_or_else(|| "mosh-server-real".to_string()),
@@ -179,7 +181,7 @@ impl ServiceState {
         }
         entry.summary.bind_addr = bind_addr.or(entry.summary.bind_addr.clone());
         entry.summary.udp_port = event.udp_port.or(entry.summary.udp_port);
-        entry.summary.client_addr = client_addr.or(entry.summary.client_addr.clone());
+        apply_client_peer(&mut entry.summary, client_addr, event_unix_ms);
         if let Some(cmdline) = cmdline
             && !cmdline.trim().is_empty()
         {
@@ -280,6 +282,7 @@ impl ServiceState {
                         bind_addr: session.bind_addr.clone(),
                         udp_port: session.udp_port,
                         client_addr: None,
+                        peer: SessionPeerInfo::default(),
                         cmdline: session.cmdline.clone(),
                         metrics: SessionMetrics::default(),
                     },
@@ -478,6 +481,30 @@ pub fn instrumented_session_id(pid: i32, started_at_unix_ms: i64) -> String {
 
 pub fn legacy_session_id(pid: i32, started_at_unix_ms: i64) -> String {
     format!("legacy:{started_at_unix_ms}:{pid}")
+}
+
+fn apply_client_peer(
+    summary: &mut SessionSummary,
+    client_addr: Option<String>,
+    observed_at_unix_ms: i64,
+) {
+    match client_addr {
+        Some(client_addr) => {
+            let changed = summary.peer.last_client_addr.as_deref() != Some(client_addr.as_str());
+            if changed && let Some(previous) = summary.peer.last_client_addr.clone() {
+                summary.peer.previous_client_addr = Some(previous);
+                summary.peer.client_addr_changed_at_unix_ms = Some(observed_at_unix_ms);
+            }
+            summary.peer.current_client_addr = Some(client_addr.clone());
+            summary.peer.last_client_addr = Some(client_addr.clone());
+            summary.peer.last_client_seen_at_unix_ms = Some(observed_at_unix_ms);
+            summary.client_addr = Some(client_addr);
+        }
+        None => {
+            summary.peer.current_client_addr = None;
+            summary.client_addr = summary.peer.last_client_addr.clone();
+        }
+    }
 }
 
 fn retransmit_pct(history: &VecDeque<CounterSample>, window_ms: i64) -> RetransmitWindow {
@@ -818,6 +845,68 @@ mod tests {
         assert_eq!(
             detail.summary.display_session_id.as_deref(),
             Some("session-1")
+        );
+    }
+
+    #[test]
+    fn null_client_addr_clears_current_peer_but_keeps_last_known_peer() {
+        let mut state = ServiceState::new(AppConfig::default());
+        let session_id = instrumented_session_id(4242, 1);
+        state.apply_telemetry(session_id.clone(), telemetry_event(1_000, 100, 100));
+
+        let mut disconnected = telemetry_event(2_000, 100, 100);
+        disconnected.client_addr = None;
+        state.apply_telemetry(session_id.clone(), disconnected);
+
+        let detail = state
+            .session_detail(&session_id, 2_000)
+            .expect("session detail");
+        assert_eq!(detail.summary.peer.current_client_addr, None);
+        assert_eq!(
+            detail.summary.peer.last_client_addr.as_deref(),
+            Some("192.0.2.10:60001")
+        );
+        assert_eq!(detail.summary.peer.last_client_seen_at_unix_ms, Some(1_000));
+        assert_eq!(
+            detail.summary.client_addr.as_deref(),
+            Some("192.0.2.10:60001")
+        );
+    }
+
+    #[test]
+    fn changed_client_addr_tracks_previous_peer_and_change_time() {
+        let mut state = ServiceState::new(AppConfig::default());
+        let session_id = instrumented_session_id(4242, 1);
+        state.apply_telemetry(session_id.clone(), telemetry_event(1_000, 100, 100));
+
+        let mut roamed = telemetry_event(2_000, 100, 100);
+        roamed.client_addr = Some("198.51.100.20:60001".to_string());
+        state.apply_telemetry(session_id.clone(), roamed.clone());
+        state.apply_telemetry(session_id.clone(), roamed);
+
+        let detail = state
+            .session_detail(&session_id, 2_000)
+            .expect("session detail");
+        assert_eq!(
+            detail.summary.peer.current_client_addr.as_deref(),
+            Some("198.51.100.20:60001")
+        );
+        assert_eq!(
+            detail.summary.peer.last_client_addr.as_deref(),
+            Some("198.51.100.20:60001")
+        );
+        assert_eq!(
+            detail.summary.peer.previous_client_addr.as_deref(),
+            Some("192.0.2.10:60001")
+        );
+        assert_eq!(
+            detail.summary.peer.client_addr_changed_at_unix_ms,
+            Some(2_000)
+        );
+        assert_eq!(detail.summary.peer.last_client_seen_at_unix_ms, Some(2_000));
+        assert_eq!(
+            detail.summary.client_addr.as_deref(),
+            Some("198.51.100.20:60001")
         );
     }
 

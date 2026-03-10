@@ -670,7 +670,8 @@ mod tests {
     };
 
     use moshwatch_core::{
-        HealthState, HistorySample, ObserverInfo, SessionKind, SessionMetrics, SessionSummary,
+        HealthState, HistorySample, ObserverInfo, SessionKind, SessionMetrics, SessionPeerInfo,
+        SessionSummary,
     };
 
     use super::{HistoryStore, MAX_HISTORY_LINE_BYTES, ReadLineOutcome, read_bounded_line};
@@ -694,6 +695,11 @@ mod tests {
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),
+            peer: SessionPeerInfo {
+                current_client_addr: Some("192.0.2.1:60001".to_string()),
+                last_client_addr: Some("192.0.2.1:60001".to_string()),
+                ..SessionPeerInfo::default()
+            },
             cmdline: "mosh-server-real".to_string(),
             metrics: SessionMetrics::default(),
         }

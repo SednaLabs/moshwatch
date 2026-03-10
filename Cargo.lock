@@ -818,6 +818,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "libc",
  "moshwatch-core",
  "ratatui",
  "serde",
