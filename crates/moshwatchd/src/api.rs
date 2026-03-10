@@ -757,6 +757,13 @@ mod tests {
         String::from_utf8(response).expect("utf8 response")
     }
 
+    fn json_body(response: &str) -> serde_json::Value {
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("response should contain headers");
+        serde_json::from_str(body).expect("json body")
+    }
+
     fn sample_event(unix_ms: i64) -> TelemetryEvent {
         TelemetryEvent {
             event: TelemetryEventKind::SessionTick,
@@ -818,12 +825,51 @@ mod tests {
         task.abort();
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            response.contains("\"observer\":{\"node_name\":\"node-1\",\"system_id\":\"system-1\"}")
+        let body = json_body(&response);
+        assert_eq!(body["observer"]["node_name"], "node-1");
+        assert_eq!(body["observer"]["system_id"], "system-1");
+        assert_eq!(body["total_sessions"], 1);
+        assert_eq!(body["dropped_sessions_total"], 1);
+        assert_eq!(body["truncated_session_count"], 0);
+        assert_eq!(
+            body["sessions"][0]["peer"]["current_client_addr"],
+            "192.0.2.1:60001"
         );
-        assert!(response.contains("\"total_sessions\":1"));
-        assert!(response.contains("\"dropped_sessions_total\":1"));
-        assert!(response.contains("\"truncated_session_count\":0"));
+        assert_eq!(body["sessions"][0]["client_addr"], "192.0.2.1:60001");
+    }
+
+    #[tokio::test]
+    async fn session_endpoint_serializes_peer_state() {
+        let tempdir = tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("api.sock");
+        let state = Arc::new(RwLock::new(ServiceState::new(AppConfig::default())));
+        let snapshots = SnapshotHub::new(observer());
+        let session_id = instrumented_session_id(42, 1_000);
+        state
+            .write()
+            .await
+            .apply_telemetry(session_id.clone(), sample_event(2_000));
+        snapshots.publish_snapshot(
+            state
+                .read()
+                .await
+                .export_summaries(2_000, MAX_EXPORTED_SESSIONS),
+            2_000,
+        );
+
+        let task = spawn_api(state, snapshots, None, &socket_path).await;
+        wait_for_socket(&socket_path).await;
+
+        let response = request(&socket_path, &format!("/v1/sessions/{session_id}")).await;
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = json_body(&response);
+        assert_eq!(
+            body["session"]["peer"]["current_client_addr"],
+            "192.0.2.1:60001"
+        );
+        assert_eq!(body["session"]["client_addr"], "192.0.2.1:60001");
     }
 
     #[tokio::test]
@@ -1083,10 +1129,19 @@ mod tests {
 
         let response = String::from_utf8(buffer).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("\"event\":\"snapshot\""));
-        assert!(
-            response.contains("\"observer\":{\"node_name\":\"node-1\",\"system_id\":\"system-1\"}")
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("stream response should contain headers");
+        let first_line = body.lines().next().expect("snapshot line");
+        let frame: serde_json::Value = serde_json::from_str(first_line).expect("snapshot frame");
+        assert_eq!(frame["schema_version"], 2);
+        assert_eq!(frame["event"], "snapshot");
+        assert_eq!(frame["observer"]["node_name"], "node-1");
+        assert_eq!(frame["observer"]["system_id"], "system-1");
+        assert_eq!(frame["sessions"][0]["session_id"], session_id);
+        assert_eq!(
+            frame["sessions"][0]["peer"]["current_client_addr"],
+            "192.0.2.1:60001"
         );
-        assert!(response.contains(&session_id));
     }
 }

@@ -10,6 +10,7 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+libc = "0.2.177"
 moshwatch-core = { path = "../moshwatch-core" }
 ratatui.workspace = true
 serde.workspace = true

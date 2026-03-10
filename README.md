@@ -347,6 +347,22 @@ Instrumented session metrics include both:
   Age since the peer last sent a new remote state. This is useful context for
   idleness, but it is not the same as connectivity silence.
 
+Instrumented session summaries now also expose explicit peer state:
+
+- `client_addr`
+  Compatibility alias for the last known remote client address.
+- `peer.current_client_addr`
+  Current peer endpoint from the most recent telemetry update, when one is
+  presently attached.
+- `peer.last_client_addr`
+  Last known peer endpoint even if the client is currently absent.
+- `peer.previous_client_addr`
+  Previous non-null peer endpoint when the client roamed to a different IP.
+- `peer.last_client_seen_at_unix_ms`
+  Last time telemetry reported a non-null current peer.
+- `peer.client_addr_changed_at_unix_ms`
+  Last time telemetry observed the session move to a different non-null peer.
+
 Persisted history samples also carry the same `observer` object so exported or
 copied history remains attributable to the host that wrote it.
 
@@ -374,7 +390,7 @@ frame with:
 The stream sends full snapshot frames plus heartbeat frames. Consumers should
 treat the snapshot as authoritative state, not as an incremental patch stream.
 
-The current event-stream `schema_version` is `1`.
+The current event-stream `schema_version` is `2`.
 
 ### Historical Persistence Notes
 

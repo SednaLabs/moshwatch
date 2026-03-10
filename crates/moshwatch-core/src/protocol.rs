@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Version number for the exported API and event-stream schema.
 ///
 /// Bump this only when a consumer-visible contract changes.
-pub const API_SCHEMA_VERSION: u32 = 1;
+pub const API_SCHEMA_VERSION: u32 = 2;
 
 /// Session classification used throughout the API and history surface.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -131,6 +131,22 @@ pub struct MetricPoint {
     pub remote_state_age_ms: Option<u64>,
 }
 
+/// Live peer state derived from verified telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SessionPeerInfo {
+    /// Current client endpoint reported by the most recent telemetry update.
+    pub current_client_addr: Option<String>,
+    /// Last known client endpoint seen for this session, even if the client is currently absent.
+    pub last_client_addr: Option<String>,
+    /// Previous non-null client endpoint when the client roamed to a new address.
+    pub previous_client_addr: Option<String>,
+    /// Last Unix-millisecond timestamp where telemetry reported a non-null client endpoint.
+    pub last_client_seen_at_unix_ms: Option<i64>,
+    /// Unix-millisecond timestamp when the session last changed to a different non-null client endpoint.
+    pub client_addr_changed_at_unix_ms: Option<i64>,
+}
+
 /// Exported live summary for one tracked session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -152,8 +168,11 @@ pub struct SessionSummary {
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
     pub udp_port: Option<u16>,
-    /// Remote client address when known.
+    /// Last known remote client address when known. Compatibility alias for `peer.last_client_addr`.
     pub client_addr: Option<String>,
+    /// Explicit live peer state derived from telemetry.
+    #[serde(default)]
+    pub peer: SessionPeerInfo,
     /// Sanitized command line used for operator display.
     pub cmdline: String,
     /// Current metrics for the session.
