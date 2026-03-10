@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Daemon entrypoint, task topology, and telemetry trust boundary.
+//!
+//! ## Rationale
+//! This file wires together discovery, verified telemetry ingestion, snapshot
+//! publication, persistence, the local API, and optional TCP metrics exposure.
+//! The interesting behavior is not in any one loop, but in how they are
+//! composed.
+//!
+//! ## Security Boundaries
+//! * Telemetry is accepted only from verified local peers on the owner-only
+//!   Unix socket.
+//! * Snapshot publication is coalesced latest-state delivery, not a replayable
+//!   event log.
+//! * Non-loopback TCP metrics exposure stays explicit opt-in.
+//!
+//! ## References
+//! * `docs/design/modularisation-and-boundaries.md`
+
 mod api;
 mod discovery;
 mod history;
@@ -511,6 +529,8 @@ async fn handle_telemetry_stream(
         invalid_frames = 0;
         valid_frame_seen = true;
         let session_id = instrumented_session_id(peer.pid, peer.started_at_unix_ms);
+        // Rewrite identity-bearing fields from the verified peer so downstream
+        // state never trusts the transport payload for process identity.
         event.pid = peer.pid;
         event.started_at_unix_ms = Some(peer.started_at_unix_ms);
         event.cmdline = Some(peer.cmdline.clone());
@@ -533,6 +553,10 @@ fn spawn_snapshot_publisher(
     let task = tokio::spawn(async move {
         let min_interval = Duration::from_millis(refresh_ms);
         loop {
+            // The stream is a latest-state feed, not a per-change log. Coalesce
+            // bursty updates behind `dirty` and publish at most once per
+            // `refresh_ms` interval so slow consumers only miss intermediate
+            // states, not the newest snapshot.
             while !worker_trigger.dirty.swap(false, Ordering::AcqRel) {
                 worker_trigger.notify.notified().await;
             }
@@ -641,6 +665,10 @@ struct VerifiedTelemetryPeer {
 fn telemetry_event_matches_peer(event: &TelemetryEvent, peer: &VerifiedTelemetryPeer) -> bool {
     const MAX_START_DRIFT_MS: i64 = 10_000;
 
+    // Treat JSON fields as untrusted until they match the verified local peer.
+    // `pid` and `started_at` are a consistency check only; accepted events are
+    // later rewritten from `SO_PEERCRED`-anchored metadata before entering
+    // state.
     if !telemetry_event_is_plausible(event) {
         return false;
     }
@@ -659,6 +687,10 @@ fn telemetry_event_matches_peer(event: &TelemetryEvent, peer: &VerifiedTelemetry
 }
 
 fn verified_telemetry_peer(stream: &UnixStream) -> Result<VerifiedTelemetryPeer> {
+    // This is the main anti-spoofing boundary for telemetry. The daemon trusts
+    // only peers whose Unix credentials belong to the current user and whose
+    // executable path is the exact instrumented `mosh-server-real` installed
+    // alongside the daemon.
     let credentials = unix_peer_credentials(stream)?;
     let expected_uid = unsafe { libc::geteuid() };
     if credentials.uid != expected_uid {

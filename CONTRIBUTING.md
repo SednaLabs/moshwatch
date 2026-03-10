@@ -20,6 +20,11 @@ or general packet-analysis tool unless that expansion is explicitly requested.
 - target `main`
 - keep changes small, focused, and easy to review
 - use short imperative commit subjects, matching the existing history
+- keep public commit subjects, bodies, and inline docs free of internal-only
+  work item references; use GitHub issues/PRs, repo-local docs, or a neutral
+  summary instead
+- keep maintainer-only runbooks and internal references in a local untracked
+  `MAINTAINER.md` or similar file rather than in the public repo
 - explain behavior changes, operator-visible output changes, and any new
   security or licensing implications in the PR description
 

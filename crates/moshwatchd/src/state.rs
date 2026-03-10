@@ -308,6 +308,13 @@ impl ServiceState {
         let stale_cutoff_ms = (self.config.cleanup_interval_ms * 3).max(30_000) as i64;
         let shutdown_grace_ms = self.config.discovery_interval_ms.max(5_000) as i64;
         let legacy_grace_ms = self.config.discovery_interval_ms.max(5_000) as i64;
+        // Session disappearance policy is intentionally asymmetric:
+        // * discovery-only legacy sessions age out quickly once `/proc` no
+        //   longer shows them
+        // * instrumented shutdown sessions get a short grace period so the UI
+        //   can observe closure
+        // * active instrumented sessions get a longer stale cutoff because
+        //   missing discovery does not override verified telemetry immediately
         self.sessions.retain(|session_id, entry| {
             if seen_ids.contains(session_id) {
                 return true;
@@ -420,6 +427,10 @@ impl ServiceState {
         // already saturated with higher-priority records. This prevents churn
         // where an attacker rotates fresh sessions and continuously evicts
         // established instrumented ones.
+        //
+        // Priority order is `legacy < instrumented shutdown < instrumented
+        // active`. `dropped_sessions_total` counts both these rejected
+        // admissions and later evictions from the tracked set.
         if shutdown || self.sessions.len() < self.config.max_tracked_sessions {
             return false;
         }
@@ -683,6 +694,8 @@ fn compare_summaries(left: &SessionSummary, right: &SessionSummary) -> Ordering 
 }
 
 fn compare_eviction_priority(left: &SessionRecord, right: &SessionRecord) -> Ordering {
+    // Lower classes lose first, then older observations, then older starts, so
+    // the daemon preserves the freshest active instrumented sessions longest.
     eviction_class(left)
         .cmp(&eviction_class(right))
         .then_with(|| {
@@ -699,6 +712,7 @@ fn compare_eviction_priority(left: &SessionRecord, right: &SessionRecord) -> Ord
 }
 
 fn eviction_class(record: &SessionRecord) -> u8 {
+    // Lower numbers are evicted first.
     match (&record.summary.kind, record.shutdown) {
         (SessionKind::Legacy, _) => 0,
         (SessionKind::Instrumented, true) => 1,
