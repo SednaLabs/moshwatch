@@ -9,6 +9,15 @@ It also emits explicit host identity metadata for attribution. Treat that as
 operator-sensitive context when sharing logs, API samples, history exports, or
 Prometheus output outside the host.
 
+## Supported Versions
+
+Security fixes are targeted at:
+
+- the latest tagged release
+- current `main`
+
+Older versions may be closed out with upgrade guidance instead of a backport.
+
 ## Supported Threat Model
 
 `moshwatch` is designed to defend these boundaries:
@@ -106,7 +115,7 @@ That opt-in does not replace normal network controls. If you expose the TCP
 listener beyond the host, you still need to decide how the bearer token is
 protected in transit and where that listener is reachable.
 
-## Operator Guidance
+## Handling Sensitive Material
 
 ### Protect the metrics token
 
@@ -117,33 +126,6 @@ protected in transit and where that listener is reachable.
 - if the token is exposed, stop the service, delete the token file, and start
   the service again to rotate it
 
-Rotation example:
-
-```bash
-systemctl --user stop moshwatchd.service
-rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/moshwatch/metrics.token"
-systemctl --user start moshwatchd.service
-```
-
-### Keep the wrapper active
-
-If SSH-launched sessions are resolving stock `/usr/bin/mosh-server`, they will
-show up as `legacy` and will not emit live telemetry. After install, verify that
-your shell resolves `~/.local/bin/mosh-server`.
-
-### Watch the pressure metrics
-
-The daemon exposes explicit signals for persistence stress and bounded-export
-stress, including:
-
-- `moshwatch_runtime_dropped_sessions_total`
-- `moshwatch_history_current_bytes`
-- `moshwatch_history_write_failures_total`
-- `moshwatch_history_prune_failures_total`
-- `moshwatch_history_dropped_samples_total`
-
-If these rise unexpectedly, treat that as an operational signal rather than
-assuming history or metrics are complete.
 
 ### Redact observer identity in public reports
 
@@ -157,20 +139,17 @@ If a report still needs host differentiation, prefer placeholders like
 `node-a`, `node-b`, or `<redacted-system-id>` rather than publishing the live
 machine identity.
 
-## Reporting
+## Reporting a Vulnerability
 
 If you find a vulnerability:
 
-- use GitHub's private vulnerability reporting or Security Advisories flow for
-  this repository when it is enabled
-- if that private GitHub flow is not enabled yet, contact the maintainer
-  privately before opening an issue
+- use GitHub Private Vulnerability Reporting for this repository
 - do not open a public GitHub issue for a security-sensitive report before
   maintainers have had a chance to assess it
 - do not include local tokens, usernames, hostnames, or internal paths in any
   report or reproduction
 
-If the problem is not security-sensitive, use GitHub Issues for the repository.
+If the problem is not security-sensitive, use GitHub Issues instead.
 
 Please include:
 
