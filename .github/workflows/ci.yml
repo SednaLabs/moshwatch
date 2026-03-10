@@ -12,8 +12,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only pull request
+        id: changes
+        shell: bash
+        run: |
+          docs_only=false
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch --no-tags --prune --depth=1 origin "${{ github.base_ref }}"
+            docs_only=true
+            while IFS= read -r path; do
+              [[ -z "$path" ]] && continue
+              case "$path" in
+                *.md|docs/*|LICENSE|NOTICE)
+                  ;;
+                *)
+                  docs_only=false
+                  break
+                  ;;
+              esac
+            done < <(git diff --name-only "origin/${{ github.base_ref }}"...HEAD)
+          fi
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
+      - name: Docs-only shortcut
+        if: github.event_name == 'pull_request' && steps.changes.outputs.docs_only == 'true'
+        run: echo "Docs-only pull request; skipping heavy validation."
 
       - name: Install system dependencies
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -30,27 +59,35 @@ jobs:
             shellcheck
 
       - name: Install Rust
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
       - name: Cache Rust build artifacts
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Format check
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: cargo fmt --all --check
 
       - name: Clippy
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: cargo test --workspace --locked
 
       - name: Shell wrapper syntax
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: bash -n scripts/mosh-server-wrapper.sh
 
       - name: Shell wrapper lint
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: shellcheck scripts/mosh-server-wrapper.sh
 
       - name: Build instrumented artifacts
+        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: cargo run --locked -p xtask -- build
