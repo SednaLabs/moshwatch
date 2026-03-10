@@ -1,0 +1,5 @@
+/target/
+/build/
+/dist/
+*.sock
+.DS_Store

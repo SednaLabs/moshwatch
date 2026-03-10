@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Unit]
+Description=moshwatch session monitor
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=@INSTALL_BIN_DIR@/moshwatchd
+Restart=on-failure
+RestartSec=2
+UMask=0077
+Nice=10
+CPUAccounting=yes
+CPUWeight=20
+MemoryAccounting=yes
+MemoryHigh=128M
+MemoryMax=256M
+TasksAccounting=yes
+TasksMax=64
+
+[Install]
+WantedBy=default.target

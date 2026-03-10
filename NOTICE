@@ -1,0 +1,12 @@
+moshwatch
+Copyright 2026 The moshwatch contributors
+
+Except where otherwise noted, the original Rust code, installer code, service templates,
+and repository documentation in this repository are licensed under GPL-3.0-or-later.
+
+This repository also vendors upstream Mosh source code in `vendor/mosh/`.
+That subtree is not covered by the first-party GPL notice above. It remains under the upstream
+licenses and notices shipped with Mosh, including GPL-based terms and exceptions.
+
+Any build or release artifact that includes the instrumented `mosh-server-real` binary must
+comply with the upstream Mosh licensing terms for that binary and its source.
