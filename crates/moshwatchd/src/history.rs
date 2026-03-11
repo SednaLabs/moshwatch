@@ -878,6 +878,37 @@ mod tests {
     }
 
     #[test]
+    fn record_uses_current_client_addr_for_history_samples() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let store = HistoryStore::new(
+            observer(),
+            tempdir.path().join("history"),
+            7,
+            128,
+            1024 * 1024,
+        );
+        let disconnected = SessionSummary {
+            client_addr: None,
+            peer: SessionPeerInfo {
+                current_client_addr: None,
+                last_client_addr: Some("192.0.2.1:60001".to_string()),
+                ..SessionPeerInfo::default()
+            },
+            ..summary("session-1", 86_400_000)
+        };
+
+        store
+            .record_summaries(86_400_000, &[disconnected])
+            .expect("record disconnected sample");
+
+        let samples = store
+            .query_session("session-1", 0, 16)
+            .expect("query samples");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].client_addr, None);
+    }
+
+    #[test]
     fn drops_samples_when_payload_exceeds_disk_budget() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let store = HistoryStore::new(observer(), tempdir.path().join("history"), 7, 128, 1);

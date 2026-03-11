@@ -891,6 +891,47 @@ mod tests {
     }
 
     #[test]
+    fn omits_stale_last_known_peer_from_client_addr_metric_label() {
+        let metrics = render_metrics(
+            &ObserverInfo {
+                node_name: "node-1".to_string(),
+                system_id: "system-1".to_string(),
+            },
+            &ExportedSummaries {
+                total_sessions: 1,
+                truncated_session_count: 0,
+                instrumented_sessions: 1,
+                legacy_sessions: 0,
+                dropped_sessions_total: 0,
+                sessions: vec![SessionSummary {
+                    session_id: "instrumented:1:42".to_string(),
+                    display_session_id: Some("display".to_string()),
+                    pid: 42,
+                    kind: SessionKind::Instrumented,
+                    health: HealthState::Ok,
+                    started_at_unix_ms: 1,
+                    last_observed_unix_ms: 2,
+                    bind_addr: Some("127.0.0.1".to_string()),
+                    udp_port: Some(60001),
+                    client_addr: None,
+                    peer: SessionPeerInfo {
+                        current_client_addr: None,
+                        last_client_addr: Some("192.0.2.10:60001".to_string()),
+                        ..SessionPeerInfo::default()
+                    },
+                    cmdline: "mosh-server-real".to_string(),
+                    metrics: SessionMetrics::default(),
+                }],
+            },
+            None,
+            RuntimeStatsSnapshot::default(),
+        );
+
+        assert!(metrics.contains("client_addr=\"\""));
+        assert!(!metrics.contains("client_addr=\"192.0.2.10:60001\""));
+    }
+
+    #[test]
     fn extracts_bearer_token_case_insensitively() {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-token\r\n\r\n";
         assert_eq!(extract_bearer_token(request), Some("secret-token"));

@@ -168,7 +168,7 @@ pub struct SessionSummary {
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
     pub udp_port: Option<u16>,
-    /// Last known remote client address when known. Compatibility alias for `peer.last_client_addr`.
+    /// Current remote client address when known. Historical peer state lives under `peer`.
     pub client_addr: Option<String>,
     /// Explicit live peer state derived from telemetry.
     #[serde(default)]

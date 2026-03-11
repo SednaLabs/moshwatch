@@ -350,7 +350,7 @@ Instrumented session metrics include both:
 Instrumented session summaries now also expose explicit peer state:
 
 - `client_addr`
-  Compatibility alias for the last known remote client address.
+  Current remote client address when one is presently attached.
 - `peer.current_client_addr`
   Current peer endpoint from the most recent telemetry update, when one is
   presently attached.
