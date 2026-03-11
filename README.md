@@ -319,8 +319,9 @@ Available endpoints:
   Local Prometheus exposition over the Unix socket.
 
 All JSON API responses include an `observer` object describing the host that
-produced the data and a `schema_version` field for the exported REST/event
-contract.
+produced the data and, on current daemons, a `schema_version` field for the
+exported REST/event contract. Clients should treat a missing REST
+`schema_version` as legacy schema `2` during staged upgrades.
 
 ### `/v1/sessions` Notes
 
