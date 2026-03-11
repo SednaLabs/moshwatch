@@ -8,7 +8,9 @@
 //! discovery integration.
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -243,7 +245,13 @@ fn install_build_helper_integration() -> Result<()> {
         .with_context(|| format!("create build-helper drop-in dir {}", drop_in_dir.display()))?;
     let rendered = render_template(
         root.join("systemd/build-helper-mcp-moshwatch-discovery.conf.template"),
-        &[("@REPO_ROOT@", root.display().to_string())],
+        &[(
+            "@DISCOVERY_ROOT_ASSIGNMENT@",
+            systemd_environment_assignment(
+                "BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS",
+                &root.display().to_string(),
+            ),
+        )],
     )?;
     let target = drop_in_dir.join("zzzzz-moshwatch-discovery.conf");
     install_text_file(&target, &rendered, 0o644)?;
@@ -263,6 +271,30 @@ fn render_template(path: PathBuf, replacements: &[(&str, String)]) -> Result<Str
         template = template.replace(needle, replacement);
     }
     Ok(template)
+}
+
+fn systemd_environment_assignment(name: &str, value: &str) -> String {
+    format!("\"{name}={}\"", systemd_escape_double_quoted(value))
+}
+
+fn systemd_escape_double_quoted(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{8}' => escaped.push_str("\\b"),
+            '\u{c}' => escaped.push_str("\\f"),
+            c if c.is_control() => {
+                let _ = write!(escaped, "\\x{:02x}", c as u32);
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn build_helper_service_exists() -> Result<bool> {
@@ -477,7 +509,7 @@ mod tests {
 
     use super::{
         PATH_BLOCK_END, PATH_BLOCK_START, Placement, install_binary, install_text_file,
-        render_template, strip_managed_block, upsert_managed_block,
+        render_template, strip_managed_block, systemd_environment_assignment, upsert_managed_block,
     };
 
     #[test]
@@ -503,24 +535,27 @@ mod tests {
     }
 
     #[test]
-    fn render_template_replaces_build_helper_repo_root() {
+    fn render_template_quotes_build_helper_repo_root_assignment() {
         let tempdir = tempdir().expect("tempdir");
         let template_path = tempdir.path().join("template.conf");
-        fs::write(
-            &template_path,
-            "Environment=BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS=@REPO_ROOT@\n",
-        )
-        .expect("write template");
+        fs::write(&template_path, "Environment=@DISCOVERY_ROOT_ASSIGNMENT@\n")
+            .expect("write template");
 
         let rendered = render_template(
             template_path,
-            &[("@REPO_ROOT@", "/tmp/moshwatch".to_string())],
+            &[(
+                "@DISCOVERY_ROOT_ASSIGNMENT@",
+                systemd_environment_assignment(
+                    "BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS",
+                    "/tmp/mosh watch",
+                ),
+            )],
         )
         .expect("render template");
 
         assert_eq!(
             rendered,
-            "Environment=BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS=/tmp/moshwatch\n"
+            "Environment=\"BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS=/tmp/mosh watch\"\n"
         );
     }
 
