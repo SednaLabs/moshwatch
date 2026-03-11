@@ -668,14 +668,14 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 fn info_metric_labels(session: &SessionSummary) -> String {
     let display_id = session.display_session_id.as_deref().unwrap_or("");
     let bind_addr = session.bind_addr.as_deref().unwrap_or("");
-    let client_addr = session.peer.current_client_addr.as_deref().unwrap_or("");
-    let last_client_addr = session.peer.last_client_addr.as_deref().unwrap_or("");
+    let client_addr = session.client_addr.as_deref().unwrap_or("");
+    let current_client_addr = session.peer.current_client_addr.as_deref().unwrap_or("");
     let udp_port = session
         .udp_port
         .map(|value| value.to_string())
         .unwrap_or_default();
     format!(
-        "session_id=\"{}\",display_session_id=\"{}\",kind=\"{}\",pid=\"{}\",started_at_unix_ms=\"{}\",bind_addr=\"{}\",udp_port=\"{}\",client_addr=\"{}\",last_client_addr=\"{}\"",
+        "session_id=\"{}\",display_session_id=\"{}\",kind=\"{}\",pid=\"{}\",started_at_unix_ms=\"{}\",bind_addr=\"{}\",udp_port=\"{}\",client_addr=\"{}\",current_client_addr=\"{}\"",
         escape_label(&session.session_id),
         escape_label(display_id),
         escape_label(match session.kind {
@@ -687,7 +687,7 @@ fn info_metric_labels(session: &SessionSummary) -> String {
         escape_label(bind_addr),
         escape_label(&udp_port),
         escape_label(client_addr),
-        escape_label(last_client_addr),
+        escape_label(current_client_addr),
     )
 }
 
@@ -874,7 +874,7 @@ mod tests {
         assert!(metrics.contains("moshwatch_session_retransmit_window_transmissions"));
         assert!(metrics.contains("moshwatch_session_retransmit_window_retransmits"));
         assert!(metrics.contains("client_addr=\"192.0.2.10:60001\""));
-        assert!(metrics.contains("last_client_addr=\"192.0.2.10:60001\""));
+        assert!(metrics.contains("current_client_addr=\"192.0.2.10:60001\""));
         assert!(metrics.contains("moshwatch_metrics_truncated_sessions 2"));
         assert!(metrics.contains("moshwatch_runtime_dropped_sessions_total 7"));
         assert!(metrics.contains("moshwatch_runtime_worker_threads 2"));
@@ -894,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_current_and_last_known_peer_metric_labels_separately() {
+    fn preserves_compatible_and_current_peer_metric_labels() {
         let metrics = render_metrics(
             &ObserverInfo {
                 node_name: "node-1".to_string(),
@@ -916,7 +916,7 @@ mod tests {
                     last_observed_unix_ms: 2,
                     bind_addr: Some("127.0.0.1".to_string()),
                     udp_port: Some(60001),
-                    client_addr: None,
+                    client_addr: Some("192.0.2.10:60001".to_string()),
                     peer: SessionPeerInfo {
                         current_client_addr: None,
                         last_client_addr: Some("192.0.2.10:60001".to_string()),
@@ -930,8 +930,8 @@ mod tests {
             RuntimeStatsSnapshot::default(),
         );
 
-        assert!(metrics.contains("client_addr=\"\""));
-        assert!(metrics.contains("last_client_addr=\"192.0.2.10:60001\""));
+        assert!(metrics.contains("client_addr=\"192.0.2.10:60001\""));
+        assert!(metrics.contains("current_client_addr=\"\""));
     }
 
     #[test]

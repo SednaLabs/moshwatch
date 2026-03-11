@@ -475,8 +475,8 @@ the daemon with `--allow-public-metrics`.
 
 Useful `moshwatch`-specific series include:
 
-Session info series use `client_addr` for the current peer when attached and
-`last_client_addr` for the most recent known peer.
+Session info series keep `client_addr` as the last-known peer for compatibility
+and add `current_client_addr` for the live attached peer when present.
 
 - `moshwatch_observer_info`
   Stable machine attribution for the daemon emitting the metric stream.
