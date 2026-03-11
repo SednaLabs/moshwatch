@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Service]
+# Allow build-helper-mcp to discover moshwatch's repo-local presets
+# even when explicit presets are configured.
+Environment=BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS=@REPO_ROOT@
+Environment=BUILD_HELPER_MCP_PRESET_DISCOVERY_MERGE_WITH_EXPLICIT=1

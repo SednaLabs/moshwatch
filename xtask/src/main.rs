@@ -4,7 +4,8 @@
 //!
 //! `xtask` owns the repo's operational install story: building the vendored
 //! `mosh-server`, copying runtime artifacts into a stable per-user prefix,
-//! wiring the wrapper, and installing the user service.
+//! wiring the wrapper, and installing the user service plus build-helper
+//! discovery integration.
 
 use std::{
     env, fs,
@@ -30,6 +31,7 @@ fn main() -> Result<()> {
             install_wrapper()?;
             install_shell_integration()?;
             install_service()?;
+            install_build_helper_integration()?;
             Ok(())
         }
         "install-artifacts" => install_artifacts(),
@@ -39,9 +41,10 @@ fn main() -> Result<()> {
         }
         "install-service" => install_service(),
         "install-shell-integration" => install_shell_integration(),
+        "install-build-helper-integration" => install_build_helper_integration(),
         _ => {
             eprintln!(
-                "usage: cargo run -p xtask -- <build|install|install-artifacts|install-wrapper|install-service|install-shell-integration>"
+                "usage: cargo run -p xtask -- <build|install|install-artifacts|install-wrapper|install-service|install-shell-integration|install-build-helper-integration>"
             );
             Ok(())
         }
@@ -229,6 +232,30 @@ fn install_service() -> Result<()> {
     Ok(())
 }
 
+fn install_build_helper_integration() -> Result<()> {
+    // Keep build-helper discovery repo-owned and relocatable. We install a
+    // drop-in, but deliberately avoid restarting build-helper from inside a
+    // build-helper task because that would disrupt the control plane.
+    let root = repo_root()?;
+    let systemd_user_dir = home_dir()?.join(".config/systemd/user");
+    let drop_in_dir = systemd_user_dir.join("build-helper-mcp.service.d");
+    fs::create_dir_all(&drop_in_dir)
+        .with_context(|| format!("create build-helper drop-in dir {}", drop_in_dir.display()))?;
+    let rendered = render_template(
+        root.join("systemd/build-helper-mcp-moshwatch-discovery.conf.template"),
+        &[("@REPO_ROOT@", root.display().to_string())],
+    )?;
+    let target = drop_in_dir.join("zzzzz-moshwatch-discovery.conf");
+    install_text_file(&target, &rendered, 0o644)?;
+    run(Command::new("systemctl").arg("--user").arg("daemon-reload"))?;
+    if build_helper_service_exists()? {
+        eprintln!(
+            "moshwatch xtask: build-helper-mcp.service detected; restart it outside build-helper task execution to apply updated discovery env"
+        );
+    }
+    Ok(())
+}
+
 fn render_template(path: PathBuf, replacements: &[(&str, String)]) -> Result<String> {
     let mut template =
         fs::read_to_string(&path).with_context(|| format!("read template {}", path.display()))?;
@@ -236,6 +263,22 @@ fn render_template(path: PathBuf, replacements: &[(&str, String)]) -> Result<Str
         template = template.replace(needle, replacement);
     }
     Ok(template)
+}
+
+fn build_helper_service_exists() -> Result<bool> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .arg("show")
+        .arg("build-helper-mcp.service")
+        .arg("--property=LoadState")
+        .arg("--value")
+        .output()
+        .context("query build-helper-mcp.service load state")?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let load_state = String::from_utf8_lossy(&output.stdout);
+    Ok(load_state.trim() == "loaded")
 }
 
 fn available_parallelism() -> usize {
@@ -460,19 +503,25 @@ mod tests {
     }
 
     #[test]
-    fn render_template_replaces_install_prefix_placeholder() {
+    fn render_template_replaces_build_helper_repo_root() {
         let tempdir = tempdir().expect("tempdir");
-        let template_path = tempdir.path().join("template.service");
-        fs::write(&template_path, "ExecStart=@INSTALL_BIN_DIR@/moshwatchd\n")
-            .expect("write template");
+        let template_path = tempdir.path().join("template.conf");
+        fs::write(
+            &template_path,
+            "Environment=BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS=@REPO_ROOT@\n",
+        )
+        .expect("write template");
 
         let rendered = render_template(
             template_path,
-            &[("@INSTALL_BIN_DIR@", "/tmp/moshwatch/bin".to_string())],
+            &[("@REPO_ROOT@", "/tmp/moshwatch".to_string())],
         )
         .expect("render template");
 
-        assert_eq!(rendered, "ExecStart=/tmp/moshwatch/bin/moshwatchd\n");
+        assert_eq!(
+            rendered,
+            "Environment=BUILD_HELPER_MCP_PRESET_DISCOVERY_ROOTS=/tmp/moshwatch\n"
+        );
     }
 
     #[test]

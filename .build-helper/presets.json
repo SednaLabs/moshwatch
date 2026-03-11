@@ -1,0 +1,77 @@
+[
+  {
+    "id": "moshwatch.fmt-check",
+    "label": "moshwatch fmt check",
+    "cwd": ".",
+    "command": ["cargo", "fmt", "--all", "--check"],
+    "allow_extra_args": false,
+    "nice": 19,
+    "ionice_class": 3,
+    "ionice_level": 0,
+    "default_priority": "low"
+  },
+  {
+    "id": "moshwatch.clippy",
+    "label": "moshwatch clippy",
+    "cwd": ".",
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "allow_extra_args": false,
+    "nice": 19,
+    "ionice_class": 3,
+    "ionice_level": 0,
+    "default_priority": "low"
+  },
+  {
+    "id": "moshwatch.test",
+    "label": "moshwatch tests",
+    "cwd": ".",
+    "command": ["cargo", "test", "--workspace", "--locked"],
+    "allow_extra_args": false,
+    "nice": 19,
+    "ionice_class": 3,
+    "ionice_level": 0,
+    "default_priority": "low"
+  },
+  {
+    "id": "moshwatch.wrapper-shellcheck",
+    "label": "moshwatch wrapper shell syntax check",
+    "cwd": ".",
+    "command": ["bash", "-n", "scripts/mosh-server-wrapper.sh"],
+    "allow_extra_args": false,
+    "nice": 19,
+    "ionice_class": 3,
+    "ionice_level": 0,
+    "default_priority": "low"
+  },
+  {
+    "id": "moshwatch.xtask-build",
+    "label": "moshwatch xtask build",
+    "cwd": ".",
+    "command": ["cargo", "run", "--locked", "-p", "xtask", "--", "build"],
+    "allow_extra_args": false,
+    "nice": 19,
+    "ionice_class": 3,
+    "ionice_level": 0,
+    "default_priority": "low"
+  },
+  {
+    "id": "moshwatch.xtask-install",
+    "label": "moshwatch xtask install",
+    "cwd": ".",
+    "command": ["cargo", "run", "--locked", "-p", "xtask", "--", "install"],
+    "allow_extra_args": false,
+    "nice": 19,
+    "ionice_class": 3,
+    "ionice_level": 0,
+    "default_priority": "low"
+  }
+]
