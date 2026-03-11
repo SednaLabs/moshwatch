@@ -502,7 +502,7 @@ fn apply_client_peer(
         }
         None => {
             summary.peer.current_client_addr = None;
-            summary.client_addr = None;
+            summary.client_addr = summary.peer.last_client_addr.clone();
         }
     }
 }
@@ -867,7 +867,10 @@ mod tests {
             Some("192.0.2.10:60001")
         );
         assert_eq!(detail.summary.peer.last_client_seen_at_unix_ms, Some(1_000));
-        assert_eq!(detail.summary.client_addr, None);
+        assert_eq!(
+            detail.summary.client_addr.as_deref(),
+            Some("192.0.2.10:60001")
+        );
     }
 
     #[test]

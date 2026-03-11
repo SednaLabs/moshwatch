@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Version number for the exported API and event-stream schema.
 ///
 /// Bump this only when a consumer-visible contract changes.
-pub const API_SCHEMA_VERSION: u32 = 2;
+pub const API_SCHEMA_VERSION: u32 = 3;
 
 /// Session classification used throughout the API and history surface.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -168,7 +168,7 @@ pub struct SessionSummary {
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
     pub udp_port: Option<u16>,
-    /// Current remote client address when known. Historical peer state lives under `peer`.
+    /// Last known remote client address when known. Compatibility alias for `peer.last_client_addr`.
     pub client_addr: Option<String>,
     /// Explicit live peer state derived from telemetry.
     #[serde(default)]
@@ -265,6 +265,8 @@ pub fn classify_health(
 /// Response body for `GET /v1/sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSessionsResponse {
+    /// Exported API schema version for this response body.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -282,6 +284,8 @@ pub struct ApiSessionsResponse {
 /// Response body for `GET /v1/sessions/:id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSessionResponse {
+    /// Exported API schema version for this response body.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -301,6 +305,8 @@ pub enum SessionControlAction {
 /// Response body for successful session control requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSessionControlResponse {
+    /// Exported API schema version for this response body.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -316,6 +322,8 @@ pub struct ApiSessionControlResponse {
 /// Response body for `GET /v1/config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfigResponse {
+    /// Exported API schema version for this response body.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -348,8 +356,11 @@ pub struct HistorySample {
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
     pub udp_port: Option<u16>,
-    /// Remote client address when known.
+    /// Last known remote client address when known. Compatibility alias for older consumers.
     pub client_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Remote client address currently attached at the sample point, when known.
+    pub current_client_addr: Option<String>,
     /// Metrics snapshot recorded with the sample.
     pub metrics: SessionMetrics,
 }
@@ -357,6 +368,8 @@ pub struct HistorySample {
 /// Response body for `GET /v1/history/:id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiHistoryResponse {
+    /// Exported API schema version for this response body.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
