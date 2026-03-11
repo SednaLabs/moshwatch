@@ -442,7 +442,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(13),
+            Constraint::Length(14),
             Constraint::Length(4),
             Constraint::Length(4),
             Constraint::Min(5),
