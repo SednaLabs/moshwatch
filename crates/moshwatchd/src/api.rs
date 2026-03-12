@@ -889,6 +889,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_endpoint_serializes_disabled_metrics_listener_as_null() {
+        let tempdir = tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("api.sock");
+        let mut config = AppConfig::default();
+        config.metrics.prometheus.listen_addr = None;
+        let state = Arc::new(RwLock::new(ServiceState::new(config)));
+        let snapshots = SnapshotHub::new(observer());
+
+        let task = spawn_api(state, snapshots, None, &socket_path).await;
+        wait_for_socket(&socket_path).await;
+
+        let response = request(&socket_path, "/v1/config").await;
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = json_body(&response);
+        assert!(body["config"]["metrics"]["listen_addr"].is_null());
+    }
+
+    #[tokio::test]
     async fn session_endpoint_serializes_peer_state() {
         let tempdir = tempdir().expect("tempdir");
         let socket_path = tempdir.path().join("api.sock");

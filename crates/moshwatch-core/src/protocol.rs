@@ -336,11 +336,12 @@ pub struct ApiSessionControlResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiMetricsConfig {
     /// TCP metrics listener address when enabled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub listen_addr: Option<String>,
     /// Whether non-loopback Prometheus binds are allowed.
     pub allow_non_loopback: bool,
     /// Prometheus detail tier for local scraping.
+    #[serde(default)]
     pub detail_tier: crate::MetricsDetailTier,
     /// OTLP metrics export configuration.
     #[serde(default)]
@@ -743,5 +744,53 @@ mod tests {
             ),
             HealthState::Ok
         );
+    }
+
+    #[test]
+    fn api_metrics_config_defaults_when_detail_tier_missing() {
+        let payload = serde_json::json!({
+            "observer": {"node_name": "node-1", "system_id": "system-1"},
+            "generated_at_unix_ms": 1,
+            "config": {
+                "refresh_ms": 1000,
+                "discovery_interval_ms": 5000,
+                "cleanup_interval_ms": 10000,
+                "history_secs": 900,
+                "max_tracked_sessions": 2048,
+                "max_session_detail_points": 900,
+                "thresholds": crate::config::HealthThresholds::default(),
+                "stream": crate::config::EventStreamConfig::default(),
+                "persistence": crate::config::PersistenceConfig::default(),
+                "metrics": {
+                    "listen_addr": null,
+                    "allow_non_loopback": false,
+                    "otlp": crate::config::OtlpMetricsConfig::default()
+                }
+            }
+        });
+
+        let parsed: super::ApiConfigResponse =
+            serde_json::from_value(payload).expect("deserialize API config response");
+        assert_eq!(
+            parsed.config.metrics.detail_tier,
+            crate::MetricsDetailTier::PerSession
+        );
+        assert_eq!(parsed.config.metrics.listen_addr, None);
+    }
+
+    #[test]
+    fn api_metrics_config_serializes_null_listen_addr_for_disabled_listener() {
+        let mut config = crate::config::AppConfig::default();
+        config.metrics.prometheus.listen_addr = None;
+        let payload = super::ApiConfigResponse {
+            observer: crate::identity::ObserverInfo {
+                node_name: "node-1".to_string(),
+                system_id: "system-1".to_string(),
+            },
+            generated_at_unix_ms: 1,
+            config: (&config).into(),
+        };
+        let value = serde_json::to_value(payload).expect("serialize API config response");
+        assert!(value["config"]["metrics"]["listen_addr"].is_null());
     }
 }

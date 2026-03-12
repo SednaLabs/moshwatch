@@ -1018,6 +1018,7 @@ fn health_level(health: &HealthState) -> u8 {
 fn build_otlp_client(config: &AppConfig) -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_millis(config.metrics.otlp.timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build OTLP HTTP client")
 }
@@ -1374,7 +1375,7 @@ mod tests {
     use prost::Message;
 
     use super::{
-        MetricCollectionOptions, MetricsTextFormat, OtlpExporterStatsSnapshot,
+        MetricCollectionOptions, MetricsTextFormat, OtlpExporterStatsSnapshot, build_otlp_client,
         collect_metric_samples, encode_otlp_metrics, extract_bearer_token,
         metrics_request_is_authorized, otlp_headers, render_metrics, requested_metrics_format,
         unix_nanos,
@@ -1610,6 +1611,48 @@ mod tests {
             "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "expected-token"
         ));
+    }
+
+    #[tokio::test]
+    async fn otlp_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect test listener");
+        let endpoint = format!(
+            "http://{}/v1/metrics",
+            listener.local_addr().expect("listener addr")
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept redirect request");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read redirect request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/v1/metrics\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write redirect response");
+        });
+
+        let mut config = AppConfig::default();
+        config.metrics.otlp.endpoint = endpoint.clone();
+        config.metrics.otlp.timeout_ms = 1_000;
+
+        let response = build_otlp_client(&config)
+            .expect("build OTLP client")
+            .post(endpoint)
+            .body(Vec::new())
+            .send()
+            .await
+            .expect("OTLP request should return redirect response without following");
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
     }
 
     #[test]
