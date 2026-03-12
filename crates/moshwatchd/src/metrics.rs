@@ -129,14 +129,45 @@ pub fn requested_metrics_format(request: &str) -> MetricsTextFormat {
         if !name.eq_ignore_ascii_case("accept") {
             continue;
         }
-        if value
-            .to_ascii_lowercase()
-            .contains("application/openmetrics-text")
-        {
+        if accept_header_allows_openmetrics(value) {
             return MetricsTextFormat::OpenMetricsText;
         }
     }
     MetricsTextFormat::PrometheusText
+}
+
+fn accept_header_allows_openmetrics(value: &str) -> bool {
+    value.split(',').any(accept_item_allows_openmetrics)
+}
+
+fn accept_item_allows_openmetrics(item: &str) -> bool {
+    let mut parts = item.split(';');
+    let Some(media_type) = parts.next().map(str::trim) else {
+        return false;
+    };
+    if !media_type.eq_ignore_ascii_case("application/openmetrics-text") {
+        return false;
+    }
+
+    let mut quality = 1.0_f32;
+    for parameter in parts {
+        let Some((name, raw_value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("q") {
+            continue;
+        }
+        let Ok(parsed) = raw_value.trim().trim_matches('"').parse::<f32>() else {
+            return false;
+        };
+        if !(0.0..=1.0).contains(&parsed) {
+            return false;
+        }
+        quality = parsed;
+        break;
+    }
+
+    quality > 0.0
 }
 
 pub fn render_metrics(
@@ -1532,6 +1563,15 @@ mod tests {
         assert_eq!(
             requested_metrics_format(request),
             MetricsTextFormat::OpenMetricsText
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_q_zero_falls_back_to_prometheus_text() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; q=0, text/plain\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            MetricsTextFormat::PrometheusText
         );
     }
 
