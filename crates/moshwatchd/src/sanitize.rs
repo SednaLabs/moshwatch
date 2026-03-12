@@ -47,6 +47,7 @@ pub fn sanitize_history_sample(mut sample: HistorySample) -> Option<HistorySampl
     sample.display_session_id = sanitize_display_session_id(sample.display_session_id);
     sample.bind_addr = sanitize_endpoint(sample.bind_addr);
     sample.client_addr = sanitize_endpoint(sample.client_addr);
+    sample.current_client_addr = sanitize_endpoint(sample.current_client_addr);
     sample.observer = sample.observer.and_then(sanitize_observer_info);
     sample.metrics.srtt_ms = sanitize_nonnegative_metric(sample.metrics.srtt_ms);
     sample.metrics.rttvar_ms = sanitize_nonnegative_metric(sample.metrics.rttvar_ms);
@@ -177,6 +178,7 @@ mod tests {
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),
+            current_client_addr: Some("192.0.2.1:60001".to_string()),
             metrics: SessionMetrics::default(),
         };
         assert!(sanitize_history_sample(sample).is_none());
@@ -199,6 +201,7 @@ mod tests {
             bind_addr: Some("127.0.0.1\r\n".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001\t".to_string()),
+            current_client_addr: Some("192.0.2.1:60001\t".to_string()),
             metrics: SessionMetrics {
                 srtt_ms: Some(f64::INFINITY),
                 rttvar_ms: Some(-1.0),
@@ -212,6 +215,10 @@ mod tests {
         assert_eq!(sanitized.display_session_id.as_deref(), Some("display id"));
         assert_eq!(sanitized.bind_addr.as_deref(), Some("127.0.0.1"));
         assert_eq!(sanitized.client_addr.as_deref(), Some("192.0.2.1:60001"));
+        assert_eq!(
+            sanitized.current_client_addr.as_deref(),
+            Some("192.0.2.1:60001")
+        );
         assert_eq!(
             sanitized.observer,
             Some(ObserverInfo {

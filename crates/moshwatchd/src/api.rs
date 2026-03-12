@@ -282,6 +282,7 @@ async fn build_response(
             let guard = context.state.read().await;
             let export = guard.export_summaries(now_ms, MAX_EXPORTED_SESSIONS);
             let response = ApiSessionsResponse {
+                schema_version: API_SCHEMA_VERSION,
                 observer: context.observer.clone(),
                 generated_at_unix_ms: now_ms,
                 total_sessions: export.total_sessions,
@@ -298,6 +299,7 @@ async fn build_response(
         ("GET", "/v1/config") => {
             let guard = context.state.read().await;
             let response = ApiConfigResponse {
+                schema_version: API_SCHEMA_VERSION,
                 observer: context.observer.clone(),
                 generated_at_unix_ms: now_ms,
                 config: guard.config().clone(),
@@ -334,6 +336,7 @@ async fn build_response(
             let guard = context.state.read().await;
             if let Some(session) = guard.session_detail(session_id, now_ms) {
                 let response = ApiSessionResponse {
+                    schema_version: API_SCHEMA_VERSION,
                     observer: context.observer.clone(),
                     generated_at_unix_ms: now_ms,
                     session,
@@ -398,6 +401,7 @@ async fn build_response(
                 .await
                 .context("wait for history query task")??;
                 let response = ApiHistoryResponse {
+                    schema_version: API_SCHEMA_VERSION,
                     observer: context.observer.clone(),
                     generated_at_unix_ms: now_ms,
                     session_id,
@@ -485,6 +489,7 @@ async fn terminate_session(
     }
 
     let response = ApiSessionControlResponse {
+        schema_version: API_SCHEMA_VERSION,
         observer: context.observer.clone(),
         generated_at_unix_ms: now_ms,
         session_id: summary.session_id,
@@ -826,6 +831,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
+        assert_eq!(body["schema_version"], 3);
         assert_eq!(body["observer"]["node_name"], "node-1");
         assert_eq!(body["observer"]["system_id"], "system-1");
         assert_eq!(body["total_sessions"], 1);
@@ -849,12 +855,18 @@ mod tests {
             .write()
             .await
             .apply_telemetry(session_id.clone(), sample_event(2_000));
+        let mut disconnected = sample_event(2_500);
+        disconnected.client_addr = None;
+        state
+            .write()
+            .await
+            .apply_telemetry(session_id.clone(), disconnected);
         snapshots.publish_snapshot(
             state
                 .read()
                 .await
-                .export_summaries(2_000, MAX_EXPORTED_SESSIONS),
-            2_000,
+                .export_summaries(2_500, MAX_EXPORTED_SESSIONS),
+            2_500,
         );
 
         let task = spawn_api(state, snapshots, None, &socket_path).await;
@@ -865,8 +877,13 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
+        assert_eq!(body["schema_version"], 3);
         assert_eq!(
             body["session"]["peer"]["current_client_addr"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            body["session"]["peer"]["last_client_addr"],
             "192.0.2.1:60001"
         );
         assert_eq!(body["session"]["client_addr"], "192.0.2.1:60001");
@@ -920,18 +937,25 @@ mod tests {
         let state = Arc::new(RwLock::new(ServiceState::new(AppConfig::default())));
         let snapshots = SnapshotHub::new(observer());
         let session_id = instrumented_session_id(42, 1_000);
+        let now_ms = moshwatch_core::time::unix_time_ms();
         state
             .write()
             .await
-            .apply_telemetry(session_id.clone(), sample_event(2_000));
+            .apply_telemetry(session_id.clone(), sample_event(now_ms - 1_000));
+        let mut disconnected = sample_event(now_ms);
+        disconnected.client_addr = None;
+        state
+            .write()
+            .await
+            .apply_telemetry(session_id.clone(), disconnected);
         let exported = state
             .read()
             .await
-            .export_summaries(2_000, MAX_EXPORTED_SESSIONS);
+            .export_summaries(now_ms, MAX_EXPORTED_SESSIONS);
         history_store
-            .record_summaries(2_000, &exported.sessions)
+            .record_summaries(now_ms, &exported.sessions)
             .expect("record summaries");
-        snapshots.publish_snapshot(exported, 2_000);
+        snapshots.publish_snapshot(exported, now_ms);
 
         let task = spawn_api(state, snapshots, Some(history_store), &socket_path).await;
         wait_for_socket(&socket_path).await;
@@ -944,11 +968,16 @@ mod tests {
         task.abort();
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("\"samples\""));
-        assert!(
-            response.contains("\"observer\":{\"node_name\":\"node-1\",\"system_id\":\"system-1\"}")
+        let body = json_body(&response);
+        assert_eq!(body["schema_version"], 3);
+        assert_eq!(body["observer"]["node_name"], "node-1");
+        assert_eq!(body["observer"]["system_id"], "system-1");
+        assert_eq!(body["session_id"], session_id);
+        assert_eq!(body["samples"][0]["client_addr"], "192.0.2.1:60001");
+        assert_eq!(
+            body["samples"][0]["current_client_addr"],
+            serde_json::Value::Null
         );
-        assert!(response.contains(&session_id));
     }
 
     #[tokio::test]
@@ -1134,7 +1163,7 @@ mod tests {
             .expect("stream response should contain headers");
         let first_line = body.lines().next().expect("snapshot line");
         let frame: serde_json::Value = serde_json::from_str(first_line).expect("snapshot frame");
-        assert_eq!(frame["schema_version"], 2);
+        assert_eq!(frame["schema_version"], 3);
         assert_eq!(frame["event"], "snapshot");
         assert_eq!(frame["observer"]["node_name"], "node-1");
         assert_eq!(frame["observer"]["system_id"], "system-1");

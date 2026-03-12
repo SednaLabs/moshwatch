@@ -319,7 +319,9 @@ Available endpoints:
   Local Prometheus exposition over the Unix socket.
 
 All JSON API responses include an `observer` object describing the host that
-produced the data.
+produced the data and, on current daemons, a `schema_version` field for the
+exported REST/event contract. Clients should treat a missing REST
+`schema_version` as legacy schema `2` during staged upgrades.
 
 ### `/v1/sessions` Notes
 
@@ -363,6 +365,10 @@ Instrumented session summaries now also expose explicit peer state:
 - `peer.client_addr_changed_at_unix_ms`
   Last time telemetry observed the session move to a different non-null peer.
 
+Persisted history samples keep `client_addr` as the last-known peer for
+compatibility and add `current_client_addr` when a client is actively attached
+at that recording point.
+
 Persisted history samples also carry the same `observer` object so exported or
 copied history remains attributable to the host that wrote it.
 
@@ -390,7 +396,7 @@ frame with:
 The stream sends full snapshot frames plus heartbeat frames. Consumers should
 treat the snapshot as authoritative state, not as an incremental patch stream.
 
-The current event-stream `schema_version` is `2`.
+The current event-stream `schema_version` is `3`.
 
 ### Historical Persistence Notes
 
@@ -468,6 +474,9 @@ the daemon with `--allow-public-metrics`.
 ### Prometheus-Specific Signals
 
 Useful `moshwatch`-specific series include:
+
+Session info series keep `client_addr` as the last-known peer for compatibility
+and add `current_client_addr` for the live attached peer when present.
 
 - `moshwatch_observer_info`
   Stable machine attribution for the daemon emitting the metric stream.

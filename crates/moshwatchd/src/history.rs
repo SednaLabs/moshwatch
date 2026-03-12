@@ -505,7 +505,8 @@ fn encode_history_payload(
             started_at_unix_ms: summary.started_at_unix_ms,
             bind_addr: summary.bind_addr.clone(),
             udp_port: summary.udp_port,
-            client_addr: summary.client_addr.clone(),
+            client_addr: summary.peer.last_client_addr.clone(),
+            current_client_addr: summary.peer.current_client_addr.clone(),
             metrics: summary.metrics.clone(),
         };
         serde_json::to_writer(&mut payload, &sample).context("encode history sample")?;
@@ -878,6 +879,38 @@ mod tests {
     }
 
     #[test]
+    fn record_preserves_last_known_client_addr_and_current_peer_state() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let store = HistoryStore::new(
+            observer(),
+            tempdir.path().join("history"),
+            7,
+            128,
+            1024 * 1024,
+        );
+        let disconnected = SessionSummary {
+            client_addr: None,
+            peer: SessionPeerInfo {
+                current_client_addr: None,
+                last_client_addr: Some("192.0.2.1:60001".to_string()),
+                ..SessionPeerInfo::default()
+            },
+            ..summary("session-1", 86_400_000)
+        };
+
+        store
+            .record_summaries(86_400_000, &[disconnected])
+            .expect("record disconnected sample");
+
+        let samples = store
+            .query_session("session-1", 0, 16)
+            .expect("query samples");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].client_addr.as_deref(), Some("192.0.2.1:60001"));
+        assert_eq!(samples[0].current_client_addr, None);
+    }
+
+    #[test]
     fn drops_samples_when_payload_exceeds_disk_budget() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let store = HistoryStore::new(observer(), tempdir.path().join("history"), 7, 128, 1);
@@ -914,6 +947,7 @@ mod tests {
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),
+            current_client_addr: Some("192.0.2.1:60001".to_string()),
             metrics: SessionMetrics::default(),
         })
         .expect("encode legacy history sample");
@@ -945,6 +979,7 @@ mod tests {
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),
+            current_client_addr: None,
             metrics: SessionMetrics::default(),
         })
         .expect("encode invalid history sample");

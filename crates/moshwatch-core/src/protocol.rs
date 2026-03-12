@@ -22,7 +22,14 @@ use serde::{Deserialize, Serialize};
 /// Version number for the exported API and event-stream schema.
 ///
 /// Bump this only when a consumer-visible contract changes.
-pub const API_SCHEMA_VERSION: u32 = 2;
+pub const API_SCHEMA_VERSION: u32 = 3;
+
+/// Schema version implied by REST responses from daemons older than v3.
+pub const LEGACY_REST_SCHEMA_VERSION: u32 = 2;
+
+fn default_rest_schema_version() -> u32 {
+    LEGACY_REST_SCHEMA_VERSION
+}
 
 /// Session classification used throughout the API and history surface.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -265,6 +272,9 @@ pub fn classify_health(
 /// Response body for `GET /v1/sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSessionsResponse {
+    #[serde(default = "default_rest_schema_version")]
+    /// Exported API schema version for this response body. Missing values decode as the legacy v2 REST schema.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -282,6 +292,9 @@ pub struct ApiSessionsResponse {
 /// Response body for `GET /v1/sessions/:id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSessionResponse {
+    #[serde(default = "default_rest_schema_version")]
+    /// Exported API schema version for this response body. Missing values decode as the legacy v2 REST schema.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -301,6 +314,9 @@ pub enum SessionControlAction {
 /// Response body for successful session control requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSessionControlResponse {
+    #[serde(default = "default_rest_schema_version")]
+    /// Exported API schema version for this response body. Missing values decode as the legacy v2 REST schema.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -316,6 +332,9 @@ pub struct ApiSessionControlResponse {
 /// Response body for `GET /v1/config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfigResponse {
+    #[serde(default = "default_rest_schema_version")]
+    /// Exported API schema version for this response body. Missing values decode as the legacy v2 REST schema.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -348,8 +367,11 @@ pub struct HistorySample {
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
     pub udp_port: Option<u16>,
-    /// Remote client address when known.
+    /// Last known remote client address when known. Compatibility alias for older consumers.
     pub client_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Remote client address currently attached at the sample point, when known.
+    pub current_client_addr: Option<String>,
     /// Metrics snapshot recorded with the sample.
     pub metrics: SessionMetrics,
 }
@@ -357,6 +379,9 @@ pub struct HistorySample {
 /// Response body for `GET /v1/history/:id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiHistoryResponse {
+    #[serde(default = "default_rest_schema_version")]
+    /// Exported API schema version for this response body. Missing values decode as the legacy v2 REST schema.
+    pub schema_version: u32,
     /// Observer identity of the reporting daemon.
     pub observer: crate::identity::ObserverInfo,
     /// Response generation time in Unix milliseconds.
@@ -461,8 +486,123 @@ pub struct TelemetryEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{HealthState, SessionKind, SessionMetrics, classify_health};
-    use crate::config::HealthThresholds;
+    use serde_json::Value;
+
+    use super::{
+        ApiConfigResponse, ApiHistoryResponse, ApiSessionControlResponse, ApiSessionResponse,
+        ApiSessionsResponse, HealthState, LEGACY_REST_SCHEMA_VERSION, SessionControlAction,
+        SessionKind, SessionMetrics, SessionPeerInfo, SessionSummary, classify_health,
+    };
+    use crate::{
+        config::{AppConfig, HealthThresholds},
+        identity::ObserverInfo,
+    };
+
+    fn observer() -> ObserverInfo {
+        ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        }
+    }
+
+    fn session_summary() -> SessionSummary {
+        SessionSummary {
+            session_id: "instrumented:1000:42".to_string(),
+            display_session_id: Some("display-1".to_string()),
+            pid: 42,
+            kind: SessionKind::Instrumented,
+            health: HealthState::Ok,
+            started_at_unix_ms: 1_000,
+            last_observed_unix_ms: 2_000,
+            bind_addr: Some("127.0.0.1".to_string()),
+            udp_port: Some(60001),
+            client_addr: Some("192.0.2.1:60001".to_string()),
+            peer: SessionPeerInfo {
+                current_client_addr: Some("192.0.2.1:60001".to_string()),
+                last_client_addr: Some("192.0.2.1:60001".to_string()),
+                ..SessionPeerInfo::default()
+            },
+            cmdline: "mosh-server-real".to_string(),
+            metrics: SessionMetrics::default(),
+        }
+    }
+
+    fn strip_schema_version(mut value: Value) -> Value {
+        value
+            .as_object_mut()
+            .expect("response should encode as object")
+            .remove("schema_version");
+        value
+    }
+
+    #[test]
+    fn rest_responses_accept_missing_schema_version_from_v2_daemons() {
+        let sessions: ApiSessionsResponse = serde_json::from_value(strip_schema_version(
+            serde_json::to_value(ApiSessionsResponse {
+                schema_version: super::API_SCHEMA_VERSION,
+                observer: observer(),
+                generated_at_unix_ms: 2_000,
+                total_sessions: 1,
+                truncated_session_count: 0,
+                dropped_sessions_total: 0,
+                sessions: vec![session_summary()],
+            })
+            .expect("encode sessions response"),
+        ))
+        .expect("decode sessions response without schema_version");
+        assert_eq!(sessions.schema_version, LEGACY_REST_SCHEMA_VERSION);
+
+        let session: ApiSessionResponse = serde_json::from_value(strip_schema_version(
+            serde_json::to_value(ApiSessionResponse {
+                schema_version: super::API_SCHEMA_VERSION,
+                observer: observer(),
+                generated_at_unix_ms: 2_000,
+                session: session_summary().with_history(0, 0, Vec::new()),
+            })
+            .expect("encode session response"),
+        ))
+        .expect("decode session response without schema_version");
+        assert_eq!(session.schema_version, LEGACY_REST_SCHEMA_VERSION);
+
+        let control: ApiSessionControlResponse = serde_json::from_value(strip_schema_version(
+            serde_json::to_value(ApiSessionControlResponse {
+                schema_version: super::API_SCHEMA_VERSION,
+                observer: observer(),
+                generated_at_unix_ms: 2_000,
+                session_id: "instrumented:1000:42".to_string(),
+                pid: 42,
+                action: SessionControlAction::Terminate,
+            })
+            .expect("encode control response"),
+        ))
+        .expect("decode control response without schema_version");
+        assert_eq!(control.schema_version, LEGACY_REST_SCHEMA_VERSION);
+
+        let config: ApiConfigResponse = serde_json::from_value(strip_schema_version(
+            serde_json::to_value(ApiConfigResponse {
+                schema_version: super::API_SCHEMA_VERSION,
+                observer: observer(),
+                generated_at_unix_ms: 2_000,
+                config: AppConfig::default(),
+            })
+            .expect("encode config response"),
+        ))
+        .expect("decode config response without schema_version");
+        assert_eq!(config.schema_version, LEGACY_REST_SCHEMA_VERSION);
+
+        let history: ApiHistoryResponse = serde_json::from_value(strip_schema_version(
+            serde_json::to_value(ApiHistoryResponse {
+                schema_version: super::API_SCHEMA_VERSION,
+                observer: observer(),
+                generated_at_unix_ms: 2_000,
+                session_id: "instrumented:1000:42".to_string(),
+                samples: Vec::new(),
+            })
+            .expect("encode history response"),
+        ))
+        .expect("decode history response without schema_version");
+        assert_eq!(history.schema_version, LEGACY_REST_SCHEMA_VERSION);
+    }
 
     #[test]
     fn legacy_sessions_stay_legacy() {

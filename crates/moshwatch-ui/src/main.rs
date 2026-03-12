@@ -705,7 +705,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(13),
+                Constraint::Length(14),
                 Constraint::Length(4),
                 Constraint::Length(4),
                 Constraint::Min(5),
@@ -1562,17 +1562,17 @@ fn resolve_current_session_id_with_lookup<F>(
 where
     F: FnMut(i32) -> Option<ProcessIdentity>,
 {
+    if let Some(tmux_client_pid) = tmux_client_pid
+        && let Some(session_id) = match_session_by_ancestry(summaries, tmux_client_pid, &mut lookup)
+    {
+        return Some(session_id);
+    }
+
     if let Some(display_session_id) = explicit_display_session_id
         && let Some(session_id) = summaries.iter().find_map(|summary| {
             (summary.display_session_id.as_deref() == Some(display_session_id))
                 .then(|| summary.session_id.clone())
         })
-    {
-        return Some(session_id);
-    }
-
-    if let Some(tmux_client_pid) = tmux_client_pid
-        && let Some(session_id) = match_session_by_ancestry(summaries, tmux_client_pid, &mut lookup)
     {
         return Some(session_id);
     }
@@ -2242,6 +2242,35 @@ mod tests {
             &[first, second],
             Some("display-2"),
             None,
+            500,
+            |pid| processes.get(&pid).copied(),
+        );
+        assert_eq!(resolved.as_deref(), Some("instrumented:2:84"));
+    }
+
+    #[test]
+    fn current_session_resolution_prefers_tmux_client_ancestry_over_inherited_display_id() {
+        let first = summary();
+        let second = SessionSummary {
+            session_id: "instrumented:2:84".to_string(),
+            display_session_id: Some("display-2".to_string()),
+            pid: 84,
+            started_at_unix_ms: 2,
+            ..summary()
+        };
+        let mut processes = HashMap::new();
+        processes.insert(
+            600,
+            ProcessIdentity {
+                pid: 84,
+                parent_pid: 1,
+                started_at_unix_ms: 2,
+            },
+        );
+        let resolved = resolve_current_session_id_with_lookup(
+            &[first, second],
+            Some("display-1"),
+            Some(600),
             500,
             |pid| processes.get(&pid).copied(),
         );
