@@ -94,3 +94,32 @@ jobs:
       - name: Build instrumented artifacts
         if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
         run: cargo run --locked -p xtask -- build
+
+
+  observability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y prometheus
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check generated observability docs
+        run: cargo run --locked -p xtask -- check-observability-docs
+
+      - name: Validate observability assets
+        run: cargo run --locked -p xtask -- validate-observability-assets

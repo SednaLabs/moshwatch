@@ -8,4 +8,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+moshwatch-core = { path = "../crates/moshwatch-core" }
+serde_json.workspace = true
 tempfile.workspace = true
+toml.workspace = true
+serde_yaml = "0.9.34"

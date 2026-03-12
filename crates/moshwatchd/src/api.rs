@@ -41,7 +41,10 @@ use tokio::{
 use crate::{
     discovery::{is_supported_mosh_server_metadata, read_process_metadata},
     history::HistoryStore,
-    metrics::render_metrics,
+    metrics::{
+        MetricsTextFormat, OtlpExporterStats, metrics_content_type, render_metrics,
+        requested_metrics_format,
+    },
     runtime_stats::RuntimeStats,
     state::{ExportedSummaries, ServiceState},
 };
@@ -126,6 +129,7 @@ pub struct AppContext {
     pub snapshots: SnapshotHub,
     pub history: Option<Arc<HistoryStore>>,
     pub runtime_stats: RuntimeStats,
+    pub otlp_stats: OtlpExporterStats,
     pub stream_heartbeat_ms: u64,
     pub stream_slots: Arc<Semaphore>,
     pub history_query_slots: Arc<Semaphore>,
@@ -204,17 +208,19 @@ async fn handle_connection(mut stream: UnixStream, context: AppContext) -> Resul
         return stream_events(stream, context).await;
     }
 
-    let (status, body, content_type) = match build_response(method, path, query, context).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!("api request processing failed: {error:#}");
-            (
-                500,
-                b"{\"error\":\"internal server error\"}".to_vec(),
-                "application/json",
-            )
-        }
-    };
+    let metrics_format = requested_metrics_format(&request);
+    let (status, body, content_type) =
+        match build_response(method, path, query, metrics_format, context).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("api request processing failed: {error:#}");
+                (
+                    500,
+                    b"{\"error\":\"internal server error\"}".to_vec(),
+                    "application/json",
+                )
+            }
+        };
     write_response_with_timeout(&mut stream, status, &body, content_type).await
 }
 
@@ -274,6 +280,7 @@ async fn build_response(
     method: &str,
     path: &str,
     query: Option<&str>,
+    metrics_format: MetricsTextFormat,
     context: AppContext,
 ) -> Result<(u16, Vec<u8>, &'static str)> {
     let now_ms = moshwatch_core::time::unix_time_ms();
@@ -311,24 +318,31 @@ async fn build_response(
             )
         }
         ("GET", "/metrics") => {
-            let guard = context.state.read().await;
-            let export =
-                guard.export_summaries(now_ms, crate::metrics::MAX_METRICS_RENDERED_SESSIONS);
+            let (config, export) = {
+                let guard = context.state.read().await;
+                (
+                    guard.config().clone(),
+                    guard.export_summaries(now_ms, crate::metrics::MAX_METRICS_RENDERED_SESSIONS),
+                )
+            };
             // The owner-only Unix socket may expose `/metrics` without bearer
             // auth because access is already constrained by filesystem
             // permissions. The separate TCP metrics listener always enforces a
             // bearer token even on loopback; both routes intentionally share
-            // the same renderer.
+            // the same renderer and content negotiation behavior.
             (
                 200,
                 render_metrics(
+                    &config,
                     &context.observer,
                     &export,
                     context.history.as_ref().map(|store| store.stats_snapshot()),
                     context.runtime_stats.snapshot(),
+                    context.otlp_stats.snapshot().await,
+                    metrics_format,
                 )
                 .into_bytes(),
-                "text/plain; version=0.0.4",
+                metrics_content_type(metrics_format),
             )
         }
         ("GET", _) if path.starts_with("/v1/sessions/") => {
@@ -681,6 +695,7 @@ mod tests {
     };
     use crate::{
         history::HistoryStore,
+        metrics::OtlpExporterStats,
         runtime_stats::RuntimeStats,
         state::{ServiceState, instrumented_session_id},
     };
@@ -721,6 +736,7 @@ mod tests {
             snapshots,
             history,
             runtime_stats: RuntimeStats::default(),
+            otlp_stats: OtlpExporterStats::default(),
             stream_heartbeat_ms: 100,
             stream_slots,
             history_query_slots: Arc::new(Semaphore::new(HISTORY_QUERY_SLOTS)),

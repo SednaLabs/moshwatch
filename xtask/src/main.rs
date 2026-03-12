@@ -14,6 +14,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use moshwatch_core::{
+    AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy, MetricsDetailTier,
+    metric_catalog,
+};
+use serde_json::Value as JsonValue;
+use serde_yaml::Value as YamlValue;
 use tempfile::NamedTempFile;
 
 const PATH_BLOCK_START: &str = "# >>> moshwatch path >>>";
@@ -39,9 +45,12 @@ fn main() -> Result<()> {
         }
         "install-service" => install_service(),
         "install-shell-integration" => install_shell_integration(),
+        "sync-observability-docs" => sync_observability_docs(false),
+        "check-observability-docs" => sync_observability_docs(true),
+        "validate-observability-assets" => validate_observability_assets(),
         _ => {
             eprintln!(
-                "usage: cargo run -p xtask -- <build|install|install-artifacts|install-wrapper|install-service|install-shell-integration>"
+                "usage: cargo run -p xtask -- <build|install|install-artifacts|install-wrapper|install-service|install-shell-integration|sync-observability-docs|check-observability-docs|validate-observability-assets>"
             );
             Ok(())
         }
@@ -390,6 +399,229 @@ fn create_temporary_file_in_same_dir(path: &Path, mode: u32) -> Result<NamedTemp
         .with_context(|| format!("create temporary file alongside {}", path.display()))?;
     set_mode_if_unix(temporary.path(), mode)?;
     Ok(temporary)
+}
+
+fn sync_observability_docs(check_only: bool) -> Result<()> {
+    let root = repo_root()?;
+    write_or_check_generated(
+        &root.join("docs/observability/metric-catalog.md"),
+        &render_metric_catalog_markdown(),
+        check_only,
+    )?;
+    write_or_check_generated(
+        &root.join("examples/observability/config/moshwatch.toml"),
+        &render_default_config_toml()?,
+        check_only,
+    )?;
+    Ok(())
+}
+
+fn validate_observability_assets() -> Result<()> {
+    let root = repo_root()?;
+    sync_observability_docs(true)?;
+
+    let required = [
+        root.join("docs/observability/operator-guide.md"),
+        root.join("docs/observability/metric-catalog.md"),
+        root.join("docs/observability/migration.md"),
+        root.join("examples/observability/README.md"),
+        root.join("examples/observability/config/moshwatch.toml"),
+        root.join("examples/observability/prometheus/README.md"),
+        root.join("examples/observability/prometheus/prometheus.yml"),
+        root.join("examples/observability/prometheus/rules/moshwatch.rules.yml"),
+        root.join("examples/observability/prometheus/tests/moshwatch.rules.test.yml"),
+        root.join("examples/observability/grafana/README.md"),
+        root.join("examples/observability/grafana/provisioning/datasources/moshwatch.yml"),
+        root.join("examples/observability/grafana/provisioning/dashboards/moshwatch.yml"),
+        root.join("examples/observability/grafana/dashboards/moshwatch-overview.json"),
+        root.join("examples/observability/otel-collector/README.md"),
+        root.join("examples/observability/otel-collector/otelcol.yaml"),
+    ];
+    for path in &required {
+        anyhow::ensure!(
+            path.exists(),
+            "missing required observability asset {}",
+            path.display()
+        );
+    }
+
+    let config: AppConfig = toml::from_str(&fs::read_to_string(
+        root.join("examples/observability/config/moshwatch.toml"),
+    )?)
+    .context("parse generated moshwatch observability config example")?;
+    config.validate()?;
+
+    parse_yaml(root.join("examples/observability/prometheus/prometheus.yml"))?;
+    parse_yaml(root.join("examples/observability/prometheus/rules/moshwatch.rules.yml"))?;
+    parse_yaml(root.join("examples/observability/prometheus/tests/moshwatch.rules.test.yml"))?;
+    parse_yaml(root.join("examples/observability/grafana/provisioning/datasources/moshwatch.yml"))?;
+    parse_yaml(root.join("examples/observability/grafana/provisioning/dashboards/moshwatch.yml"))?;
+    parse_yaml(root.join("examples/observability/otel-collector/otelcol.yaml"))?;
+
+    let dashboard =
+        parse_json(root.join("examples/observability/grafana/dashboards/moshwatch-overview.json"))?;
+    anyhow::ensure!(
+        dashboard.get("title").and_then(JsonValue::as_str).is_some(),
+        "Grafana dashboard is missing a title"
+    );
+    anyhow::ensure!(
+        dashboard
+            .get("panels")
+            .and_then(JsonValue::as_array)
+            .is_some(),
+        "Grafana dashboard is missing panels"
+    );
+    anyhow::ensure!(
+        dashboard.get("templating").is_some(),
+        "Grafana dashboard is missing templating"
+    );
+
+    if command_exists("promtool") {
+        run(Command::new("promtool")
+            .arg("check")
+            .arg("config")
+            .arg("--syntax-only")
+            .arg(root.join("examples/observability/prometheus/prometheus.yml")))?;
+        run(Command::new("promtool")
+            .arg("check")
+            .arg("rules")
+            .arg(root.join("examples/observability/prometheus/rules/moshwatch.rules.yml")))?;
+        run(Command::new("promtool")
+            .arg("test")
+            .arg("rules")
+            .arg(root.join("examples/observability/prometheus/tests/moshwatch.rules.test.yml")))?;
+    } else {
+        eprintln!("warning: promtool not found; skipping Prometheus semantic validation");
+    }
+
+    Ok(())
+}
+
+fn render_metric_catalog_markdown() -> String {
+    let mut output = String::from(
+        "<!-- Generated by `cargo run --locked -p xtask -- sync-observability-docs`; do not edit by hand. -->
+
+# Metric Catalog
+
+This file is generated from `crates/moshwatch-core/src/observability.rs`. It is the canonical exported metrics contract for Prometheus/OpenMetrics and OTLP.
+
+| Metric | Type | Unit | Labels | Minimum Detail Tier | Privacy | Cardinality | Description |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+",
+    );
+    for descriptor in metric_catalog() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut output,
+            format_args!(
+                "| `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | `{}` | {} |
+",
+                descriptor.name,
+                metric_kind_name(descriptor.kind),
+                descriptor.unit,
+                label_schema_name(descriptor.labels),
+                detail_tier_name(descriptor.minimum_detail_tier),
+                privacy_name(descriptor.privacy),
+                cardinality_name(descriptor.cardinality),
+                descriptor.help.replace('|', "\\|"),
+            ),
+        );
+    }
+    output
+}
+
+fn render_default_config_toml() -> Result<String> {
+    let config = AppConfig::default();
+    let body = toml::to_string_pretty(&config).context("render default app config TOML")?;
+    Ok(format!(
+        "# Generated by `cargo run --locked -p xtask -- sync-observability-docs`; do not edit by hand.
+
+{body}"
+    ))
+}
+
+fn write_or_check_generated(path: &Path, expected: &str, check_only: bool) -> Result<()> {
+    if check_only {
+        let actual = fs::read_to_string(path)
+            .with_context(|| format!("read generated file {}", path.display()))?;
+        anyhow::ensure!(
+            actual == expected,
+            "generated file {} is out of date; run `cargo run --locked -p xtask -- sync-observability-docs`",
+            path.display()
+        );
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create generated doc parent {}", parent.display()))?;
+    }
+    install_text_file(path, expected, 0o644)
+}
+
+fn parse_yaml(path: PathBuf) -> Result<YamlValue> {
+    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_yaml::from_str(&body).with_context(|| format!("parse YAML {}", path.display()))
+}
+
+fn parse_json(path: PathBuf) -> Result<JsonValue> {
+    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&body).with_context(|| format!("parse JSON {}", path.display()))
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn metric_kind_name(kind: MetricKind) -> &'static str {
+    match kind {
+        MetricKind::Gauge => "gauge",
+        MetricKind::Counter => "counter",
+        MetricKind::Info => "info",
+    }
+}
+
+fn cardinality_name(cardinality: MetricCardinality) -> &'static str {
+    match cardinality {
+        MetricCardinality::Static => "static",
+        MetricCardinality::Low => "low",
+        MetricCardinality::PerSession => "per_session",
+    }
+}
+
+fn privacy_name(privacy: MetricPrivacy) -> &'static str {
+    match privacy {
+        MetricPrivacy::FleetSafe => "fleet_safe",
+        MetricPrivacy::OperatorSensitive => "operator_sensitive",
+    }
+}
+
+fn label_schema_name(labels: MetricLabelSchema) -> &'static str {
+    match labels {
+        MetricLabelSchema::None => "none",
+        MetricLabelSchema::Observer => "observer",
+        MetricLabelSchema::Kind => "kind",
+        MetricLabelSchema::KindHealth => "kind,health",
+        MetricLabelSchema::Loop => "loop",
+        MetricLabelSchema::Severity => "severity",
+        MetricLabelSchema::Result => "result",
+        MetricLabelSchema::ExporterDetailTier => "detail_tier",
+        MetricLabelSchema::SessionValue => "session_id,kind",
+        MetricLabelSchema::SessionInfo => {
+            "session_id,display_session_id,kind,pid,started_at_unix_ms"
+        }
+        MetricLabelSchema::SessionWindow => "session_id,kind,window",
+    }
+}
+
+fn detail_tier_name(detail_tier: MetricsDetailTier) -> &'static str {
+    match detail_tier {
+        MetricsDetailTier::AggregateOnly => "aggregate_only",
+        MetricsDetailTier::PerSession => "per_session",
+    }
 }
 
 enum Placement {

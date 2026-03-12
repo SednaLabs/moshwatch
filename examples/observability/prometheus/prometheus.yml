@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - rules/moshwatch.rules.yml
+
+scrape_configs:
+  - job_name: moshwatch
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['127.0.0.1:9947']
+    # Replace this placeholder with the real token file path on the host that
+    # runs Prometheus.
+    bearer_token_file: /home/<user>/.local/state/moshwatch/metrics.token

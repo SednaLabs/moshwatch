@@ -1,0 +1,23 @@
+groups:
+  - name: moshwatch
+    rules:
+      - alert: MoshwatchCriticalSessions
+        expr: sum(moshwatch_sessions_by_health{kind="instrumented",health="critical"}) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: One or more instrumented Mosh sessions are critical
+
+      - alert: MoshwatchHistorySamplesDropped
+        expr: increase(moshwatch_history_dropped_samples_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: moshwatch dropped persisted history samples in the last 15 minutes
+
+      - alert: MoshwatchOtlpExporterFailures
+        expr: sum(increase(moshwatch_otlp_exports_total{result="failure"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: moshwatch OTLP export failures were observed in the last 15 minutes
