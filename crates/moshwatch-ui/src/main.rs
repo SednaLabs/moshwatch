@@ -1103,12 +1103,8 @@ fn status_line(width: u16, app: &App) -> String {
         .map(|age_ms| format!(" | snapshot {}", fmt_duration_ms(Some(age_ms))))
         .unwrap_or_default();
     let stale_note = if app.snapshot_stale { " | stale" } else { "" };
-    let notice_or_error = app
-        .last_error
-        .as_deref()
-        .or(app.last_notice.as_deref())
-        .map(|message| format!(" | {}", truncate_text(message, 32)))
-        .unwrap_or_default();
+    let notice_or_error =
+        format_status_messages(width, app.last_notice.as_deref(), app.last_error.as_deref());
 
     if let Some(pending) = &app.pending_terminate {
         let prompt = match width {
@@ -1134,6 +1130,27 @@ fn status_line(width: u16, app: &App) -> String {
             "{session_summary}{drop_note}{snapshot_note}{stale_note} | socket {}{notice_or_error} | x terminate | r refresh | q quit",
             app.api_socket.display()
         ),
+    }
+}
+
+fn format_status_messages(width: u16, notice: Option<&str>, error: Option<&str>) -> String {
+    let mut rendered = String::new();
+    if let Some(notice) = notice {
+        rendered.push_str(" | ");
+        rendered.push_str(&status_message_text(width, notice));
+    }
+    if let Some(error) = error {
+        rendered.push_str(" | ");
+        rendered.push_str(&status_message_text(width, error));
+    }
+    rendered
+}
+
+fn status_message_text(width: u16, message: &str) -> String {
+    match width {
+        0..=95 => truncate_text(message, 32),
+        96..=139 => truncate_text(message, 64),
+        _ => message.to_string(),
     }
 }
 
@@ -1737,7 +1754,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::Duration};
+    use std::{collections::HashMap, path::PathBuf, time::Duration};
 
     use ratatui::{layout::Rect, style::Color};
     use tokio::io::AsyncWriteExt;
@@ -1748,13 +1765,14 @@ mod tests {
     };
 
     use super::{
-        BodyLayoutMode, DetailLayoutMode, MAX_HTTP_RESPONSE_BYTES, ProcessIdentity,
+        App, BodyLayoutMode, DetailLayoutMode, MAX_HTTP_RESPONSE_BYTES, ProcessIdentity,
         SessionTableMode, body_layout_mode, compact_session_label, detail_layout_mode,
         display_session_label, fmt_duration_ms, fmt_windowed_pct, format_client_roam,
-        format_retransmit_window, health_reasons, next_selected_index, parse_pid_output,
-        peer_state_label, read_bounded_response, resolve_current_session_id_with_lookup,
-        retransmit_color, session_label, session_table_height, session_table_mode,
-        sparkline_point_from_pct, summarize_history, truncate_text,
+        format_retransmit_window, format_status_messages, health_reasons, next_selected_index,
+        parse_pid_output, peer_state_label, read_bounded_response,
+        resolve_current_session_id_with_lookup, retransmit_color, session_label,
+        session_table_height, session_table_mode, sparkline_point_from_pct, status_line,
+        summarize_history, truncate_text,
     };
 
     fn summary() -> SessionSummary {
@@ -2082,6 +2100,44 @@ mod tests {
         assert_eq!(truncate_text("short", 8), "short");
         assert_eq!(truncate_text("123456789", 8), "12345...");
         assert_eq!(truncate_text("123456789", 3), "123");
+    }
+
+    #[test]
+    fn status_line_keeps_full_diagnostic_on_wide_terminals() {
+        let mut app = App::new(PathBuf::from("/tmp/moshwatch/api.sock"), 1_000);
+        app.total_sessions = 2;
+        app.last_error =
+            Some("session refresh failed: unix socket response exceeded 4 MiB limit".to_string());
+
+        let status = status_line(160, &app);
+        assert!(
+            status.contains("session refresh failed: unix socket response exceeded 4 MiB limit")
+        );
+        assert!(!status.contains("..."));
+    }
+
+    #[test]
+    fn status_line_truncates_diagnostic_on_narrow_terminals() {
+        let mut app = App::new(PathBuf::from("/tmp/moshwatch/api.sock"), 1_000);
+        app.total_sessions = 2;
+        app.last_error =
+            Some("session refresh failed: unix socket response exceeded 4 MiB limit".to_string());
+
+        let status = status_line(80, &app);
+        assert!(status.contains("session refresh failed:"));
+        assert!(status.contains("..."));
+        assert!(!status.contains("response exceeded 4 MiB limit"));
+        assert!(status.contains("x term | q quit"));
+    }
+
+    #[test]
+    fn status_line_renders_notice_and_error_when_both_are_present() {
+        let rendered = format_status_messages(
+            160,
+            Some("terminate complete"),
+            Some("session refresh failed"),
+        );
+        assert_eq!(rendered, " | terminate complete | session refresh failed");
     }
 
     #[test]
