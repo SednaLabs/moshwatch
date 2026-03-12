@@ -36,7 +36,7 @@ use moshwatch_core::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, RenderDirection, Row, Sparkline, Table, Wrap},
@@ -83,6 +83,25 @@ struct App {
     last_notice: Option<String>,
     last_error: Option<String>,
     last_refresh: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyLayoutMode {
+    Columns,
+    Stacked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionTableMode {
+    Wide,
+    Compact,
+    UltraCompact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailLayoutMode {
+    Full,
+    Compact,
 }
 
 impl App {
@@ -327,56 +346,21 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(frame.area());
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
-        .split(layout[1]);
+    let body = match body_layout_mode(layout[1]) {
+        BodyLayoutMode::Columns => Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(layout[1]),
+        BodyLayoutMode::Stacked => Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(session_table_height(app.summaries.len())),
+                Constraint::Min(1),
+            ])
+            .split(layout[1]),
+    };
 
-    let session_summary = if app.truncated_session_count > 0 {
-        format!(
-            "{} shown / {} total ({} hidden)",
-            app.summaries.len(),
-            app.total_sessions,
-            app.truncated_session_count
-        )
-    } else {
-        format!("{} sessions", app.total_sessions)
-    };
-    let drop_note = if app.dropped_sessions_total > 0 {
-        format!(" | shed {}", app.dropped_sessions_total)
-    } else {
-        String::new()
-    };
-    let snapshot_note = app
-        .snapshot_generated_at_unix_ms
-        .and_then(snapshot_age_ms)
-        .map(|age_ms| format!(" | snapshot {}", fmt_duration_ms(Some(age_ms))))
-        .unwrap_or_default();
-    let stale_note = if app.snapshot_stale { " | stale" } else { "" };
-    let error_note = app
-        .last_error
-        .as_deref()
-        .map(|error| format!(" | {error}"))
-        .unwrap_or_default();
-    let notice_note = app
-        .last_notice
-        .as_deref()
-        .map(|notice| format!(" | {notice}"))
-        .unwrap_or_default();
-    let action_note = app
-        .pending_terminate
-        .as_ref()
-        .map(|pending| {
-            format!(
-                " | terminate {} (pid {})? y confirm | n cancel",
-                pending.label, pending.pid
-            )
-        })
-        .unwrap_or_else(|| " | x terminate | r refresh | q quit".to_string());
-    let status = format!(
-        "{session_summary}{drop_note}{snapshot_note}{stale_note} | socket {}{notice_note}{error_note}{action_note}",
-        app.api_socket.display()
-    );
+    let status = status_line(layout[0].width, app);
     let status_block =
         Paragraph::new(status).block(Block::default().borders(Borders::ALL).title("moshwatch"));
     frame.render_widget(status_block, layout[0]);
@@ -386,69 +370,111 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_table(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let mode = session_table_mode(area.width);
     let rows = app.summaries.iter().enumerate().map(|(index, summary)| {
         let style = row_style(summary, index == app.selected);
-        Row::new(vec![
-            Cell::from(health_label(&summary.health)),
-            Cell::from(summary.pid.to_string()),
-            Cell::from(
-                summary
-                    .udp_port
-                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
-            ),
-            Cell::from(peer_state_label(
-                summary,
-                &app.thresholds,
-                app.snapshot_generated_at_unix_ms,
-            )),
-            Cell::from(fmt_f64(summary.metrics.srtt_ms, "ms")),
-            Cell::from(fmt_windowed_pct(
-                summary.metrics.retransmit_pct_10s,
-                summary.metrics.retransmit_window_10s_complete,
-            )),
-            Cell::from(fmt_u64(summary.metrics.last_heard_age_ms, "ms")),
-            Cell::from(display_session_label(
-                summary,
-                app.current_session_id.as_deref(),
-            )),
-        ])
-        .style(style)
+        let cells = match mode {
+            SessionTableMode::Wide => vec![
+                Cell::from(health_label(&summary.health)),
+                Cell::from(summary.pid.to_string()),
+                Cell::from(
+                    summary
+                        .udp_port
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                ),
+                Cell::from(peer_state_label(
+                    summary,
+                    &app.thresholds,
+                    app.snapshot_generated_at_unix_ms,
+                )),
+                Cell::from(fmt_f64(summary.metrics.srtt_ms, "ms")),
+                Cell::from(fmt_windowed_pct(
+                    summary.metrics.retransmit_pct_10s,
+                    summary.metrics.retransmit_window_10s_complete,
+                )),
+                Cell::from(fmt_u64(summary.metrics.last_heard_age_ms, "ms")),
+                Cell::from(display_session_label(
+                    summary,
+                    app.current_session_id.as_deref(),
+                )),
+            ],
+            SessionTableMode::Compact => vec![
+                Cell::from(health_label(&summary.health)),
+                Cell::from(summary.pid.to_string()),
+                Cell::from(fmt_f64(summary.metrics.srtt_ms, "ms")),
+                Cell::from(fmt_windowed_pct(
+                    summary.metrics.retransmit_pct_10s,
+                    summary.metrics.retransmit_window_10s_complete,
+                )),
+                Cell::from(fmt_u64(summary.metrics.last_heard_age_ms, "ms")),
+                Cell::from(compact_session_label(
+                    summary,
+                    app.current_session_id.as_deref(),
+                    16,
+                )),
+            ],
+            SessionTableMode::UltraCompact => vec![
+                Cell::from(health_label(&summary.health)),
+                Cell::from(fmt_f64(summary.metrics.srtt_ms, "ms")),
+                Cell::from(fmt_windowed_pct(
+                    summary.metrics.retransmit_pct_10s,
+                    summary.metrics.retransmit_window_10s_complete,
+                )),
+                Cell::from(compact_session_label(
+                    summary,
+                    app.current_session_id.as_deref(),
+                    12,
+                )),
+            ],
+        };
+        Row::new(cells).style(style)
     });
 
-    let header = Row::new(vec![
-        "State", "PID", "Port", "Peer", "RTT", "RTX10", "Heard", "Session",
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    let (header, widths) = match mode {
+        SessionTableMode::Wide => (
+            Row::new(vec![
+                "State", "PID", "Port", "Peer", "RTT", "RTX10", "Heard", "Session",
+            ]),
+            vec![
+                Constraint::Length(9),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(15),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(10),
+                Constraint::Min(10),
+            ],
+        ),
+        SessionTableMode::Compact => (
+            Row::new(vec!["State", "PID", "RTT", "RTX10", "Heard", "Session"]),
+            vec![
+                Constraint::Length(9),
+                Constraint::Length(7),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Min(12),
+            ],
+        ),
+        SessionTableMode::UltraCompact => (
+            Row::new(vec!["State", "RTT", "RTX10", "Session"]),
+            vec![
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Min(12),
+            ],
+        ),
+    };
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(9),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(15),
-            Constraint::Length(9),
-            Constraint::Length(9),
-            Constraint::Length(10),
-            Constraint::Min(10),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL).title("Sessions"));
+    let table = Table::new(rows, widths)
+        .header(header.style(Style::default().add_modifier(Modifier::BOLD)))
+        .block(Block::default().borders(Borders::ALL).title("Sessions"));
     frame.render_widget(table, area);
 }
 
-fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(13),
-            Constraint::Length(4),
-            Constraint::Length(4),
-            Constraint::Min(5),
-        ])
-        .split(area);
-
+fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(detail) = &app.detail {
         let summary = &detail.summary;
         let retransmit_color = retransmit_color(&summary.metrics, &app.thresholds);
@@ -489,6 +515,203 @@ fn draw_detail(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
         );
         let roam_text = format_client_roam(summary, app.snapshot_generated_at_unix_ms)
             .unwrap_or_else(|| "no client roam recorded".to_string());
+        if detail_layout_mode(area) == DetailLayoutMode::Compact {
+            let compact_lines = vec![
+                Line::from(vec![
+                    Span::styled("Session ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(display_session_label(
+                        summary,
+                        app.current_session_id.as_deref(),
+                    )),
+                    Span::raw("  "),
+                    Span::styled("Health ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(health_label(&summary.health)),
+                    Span::raw("  "),
+                    Span::styled("Peer ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(peer_state_label(
+                        summary,
+                        &app.thresholds,
+                        app.snapshot_generated_at_unix_ms,
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled("Identity ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(summary.session_id.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled("PID ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(summary.pid.to_string()),
+                    Span::raw("  "),
+                    Span::styled("Bind ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(summary.bind_addr.clone().unwrap_or_else(|| "-".to_string())),
+                    Span::raw(":"),
+                    Span::raw(
+                        summary
+                            .udp_port
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Current Peer ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(current_peer),
+                ]),
+                Line::from(vec![
+                    Span::styled("Last Peer ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(last_peer),
+                    Span::raw("  "),
+                    Span::styled("Seen ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(last_peer_seen),
+                ]),
+                Line::from(vec![
+                    Span::styled("RTT ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(fmt_f64(summary.metrics.srtt_ms, "ms")),
+                    Span::raw("  "),
+                    Span::styled("RTTVAR ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(fmt_f64(summary.metrics.rttvar_ms, "ms")),
+                    Span::raw("  "),
+                    Span::styled("Last ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(fmt_f64(summary.metrics.last_rtt_ms, "ms")),
+                ]),
+                Line::from(vec![
+                    Span::styled("RTX10 ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        fmt_windowed_pct(
+                            summary.metrics.retransmit_pct_10s,
+                            summary.metrics.retransmit_window_10s_complete,
+                        ),
+                        Style::default().fg(retransmit_color),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("RTX60 ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        fmt_windowed_pct(
+                            summary.metrics.retransmit_pct_60s,
+                            summary.metrics.retransmit_window_60s_complete,
+                        ),
+                        Style::default().fg(retransmit_color),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("Heard ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(fmt_u64(summary.metrics.last_heard_age_ms, "ms")),
+                    Span::raw("  "),
+                    Span::styled("Remote ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(fmt_u64(summary.metrics.remote_state_age_ms, "ms")),
+                ]),
+                Line::from(vec![
+                    Span::styled("TX ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .packets_tx_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("RX ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .packets_rx_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("Resends ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .retransmits_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("ACKs ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .empty_acks_tx_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Updates ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .state_updates_tx_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                    Span::raw("/"),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .state_updates_rx_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("Dup ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .duplicate_states_rx_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                    Span::raw("  "),
+                    Span::styled("OOO ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(
+                        summary
+                            .metrics
+                            .out_of_order_states_rx_total
+                            .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Why ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(health_reason_text),
+                ]),
+                Line::from(vec![
+                    Span::styled("History ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(
+                        "{} shown / {} total over {} | max RTT {} | max RTX10 {}",
+                        history_diagnostics.shown_points,
+                        detail.total_history_points,
+                        fmt_duration_ms(history_diagnostics.span_ms),
+                        fmt_f64(history_diagnostics.max_rtt_ms, "ms"),
+                        fmt_f64(history_diagnostics.max_retransmit_pct, "%"),
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled("Roam ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(roam_text),
+                ]),
+                Line::from(vec![
+                    Span::styled("Command ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(summary.cmdline.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled("Charts ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw("hidden on narrow terminals; widen for RTT/RTX sparklines"),
+                ]),
+            ];
+            frame.render_widget(
+                Paragraph::new(compact_lines)
+                    .block(Block::default().borders(Borders::ALL).title("Details"))
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(13),
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Min(5),
+            ])
+            .split(area);
+
         let info = vec![
             Line::from(vec![
                 Span::styled("Session ", Style::default().add_modifier(Modifier::BOLD)),
@@ -858,6 +1081,109 @@ fn retransmit_color(metrics: &SessionMetrics, thresholds: &HealthThresholds) -> 
     }
 }
 
+fn status_line(width: u16, app: &App) -> String {
+    let session_summary = if app.truncated_session_count > 0 {
+        format!(
+            "{} shown / {} total ({} hidden)",
+            app.summaries.len(),
+            app.total_sessions,
+            app.truncated_session_count
+        )
+    } else {
+        format!("{} sessions", app.total_sessions)
+    };
+    let drop_note = if app.dropped_sessions_total > 0 {
+        format!(" | shed {}", app.dropped_sessions_total)
+    } else {
+        String::new()
+    };
+    let snapshot_note = app
+        .snapshot_generated_at_unix_ms
+        .and_then(snapshot_age_ms)
+        .map(|age_ms| format!(" | snapshot {}", fmt_duration_ms(Some(age_ms))))
+        .unwrap_or_default();
+    let stale_note = if app.snapshot_stale { " | stale" } else { "" };
+    let notice_or_error =
+        format_status_messages(width, app.last_notice.as_deref(), app.last_error.as_deref());
+
+    if let Some(pending) = &app.pending_terminate {
+        let prompt = match width {
+            0..=95 => format!(" | terminate {}? y/n", truncate_text(&pending.label, 12)),
+            _ => format!(
+                " | terminate {} (pid {})? y confirm | n cancel",
+                pending.label, pending.pid
+            ),
+        };
+        return format!(
+            "{session_summary}{drop_note}{snapshot_note}{stale_note}{notice_or_error}{prompt}"
+        );
+    }
+
+    match width {
+        0..=95 => format!(
+            "{session_summary}{drop_note}{snapshot_note}{stale_note}{notice_or_error} | x term | q quit"
+        ),
+        96..=139 => format!(
+            "{session_summary}{drop_note}{snapshot_note}{stale_note}{notice_or_error} | x terminate | r refresh | q quit"
+        ),
+        _ => format!(
+            "{session_summary}{drop_note}{snapshot_note}{stale_note} | socket {}{notice_or_error} | x terminate | r refresh | q quit",
+            app.api_socket.display()
+        ),
+    }
+}
+
+fn format_status_messages(width: u16, notice: Option<&str>, error: Option<&str>) -> String {
+    let mut rendered = String::new();
+    if let Some(notice) = notice {
+        rendered.push_str(" | ");
+        rendered.push_str(&status_message_text(width, notice));
+    }
+    if let Some(error) = error {
+        rendered.push_str(" | ");
+        rendered.push_str(&status_message_text(width, error));
+    }
+    rendered
+}
+
+fn status_message_text(width: u16, message: &str) -> String {
+    match width {
+        0..=95 => truncate_text(message, 32),
+        96..=139 => truncate_text(message, 64),
+        _ => message.to_string(),
+    }
+}
+
+fn body_layout_mode(area: Rect) -> BodyLayoutMode {
+    if area.width < 120 {
+        BodyLayoutMode::Stacked
+    } else {
+        BodyLayoutMode::Columns
+    }
+}
+
+fn session_table_height(session_count: usize) -> u16 {
+    4u16.max(session_count.min(6) as u16 + 3)
+}
+
+fn session_table_mode(width: u16) -> SessionTableMode {
+    if width < 78 {
+        SessionTableMode::UltraCompact
+    } else if width < 108 {
+        SessionTableMode::Compact
+    } else {
+        SessionTableMode::Wide
+    }
+}
+
+fn detail_layout_mode(area: Rect) -> DetailLayoutMode {
+    if area.width < 100 || area.height < 20 {
+        DetailLayoutMode::Compact
+    } else {
+        DetailLayoutMode::Full
+    }
+}
+
 fn session_label(summary: &SessionSummary) -> String {
     summary
         .display_session_id
@@ -869,6 +1195,19 @@ fn display_session_label(summary: &SessionSummary, current_session_id: Option<&s
     let label = session_label(summary);
     if current_session_id == Some(summary.session_id.as_str()) {
         format!("{label} [here]")
+    } else {
+        label
+    }
+}
+
+fn compact_session_label(
+    summary: &SessionSummary,
+    current_session_id: Option<&str>,
+    max_chars: usize,
+) -> String {
+    let label = truncate_text(&session_label(summary), max_chars);
+    if current_session_id == Some(summary.session_id.as_str()) {
+        format!("* {label}")
     } else {
         label
     }
@@ -1150,6 +1489,18 @@ fn fmt_duration_ms(value: Option<u64>) -> String {
     }
 }
 
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return text.chars().take(max_chars).collect();
+    }
+    let prefix = text.chars().take(max_chars - 3).collect::<String>();
+    format!("{prefix}...")
+}
+
 fn observed_age_ms(later_unix_ms: i64, earlier_unix_ms: i64) -> Option<u64> {
     later_unix_ms
         .checked_sub(earlier_unix_ms)
@@ -1403,9 +1754,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::Duration};
+    use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-    use ratatui::style::Color;
+    use ratatui::{layout::Rect, style::Color};
     use tokio::io::AsyncWriteExt;
 
     use moshwatch_core::{
@@ -1414,11 +1765,14 @@ mod tests {
     };
 
     use super::{
-        MAX_HTTP_RESPONSE_BYTES, ProcessIdentity, display_session_label, fmt_duration_ms,
-        fmt_windowed_pct, format_client_roam, format_retransmit_window, health_reasons,
-        next_selected_index, parse_pid_output, peer_state_label, read_bounded_response,
+        App, BodyLayoutMode, DetailLayoutMode, MAX_HTTP_RESPONSE_BYTES, ProcessIdentity,
+        SessionTableMode, body_layout_mode, compact_session_label, detail_layout_mode,
+        display_session_label, fmt_duration_ms, fmt_windowed_pct, format_client_roam,
+        format_retransmit_window, format_status_messages, health_reasons, next_selected_index,
+        parse_pid_output, peer_state_label, read_bounded_response,
         resolve_current_session_id_with_lookup, retransmit_color, session_label,
-        sparkline_point_from_pct, summarize_history,
+        session_table_height, session_table_mode, sparkline_point_from_pct, status_line,
+        summarize_history, truncate_text,
     };
 
     fn summary() -> SessionSummary {
@@ -1709,6 +2063,81 @@ mod tests {
             display_session_label(&summary, Some("instrumented:1:42")),
             "display-1 [here]"
         );
+        assert_eq!(
+            compact_session_label(&summary, Some("instrumented:1:42"), 8),
+            "* displ..."
+        );
+    }
+
+    #[test]
+    fn responsive_layout_switches_for_narrow_terminals() {
+        assert_eq!(
+            body_layout_mode(Rect::new(0, 0, 140, 30)),
+            BodyLayoutMode::Columns
+        );
+        assert_eq!(
+            body_layout_mode(Rect::new(0, 0, 90, 30)),
+            BodyLayoutMode::Stacked
+        );
+        assert_eq!(session_table_mode(120), SessionTableMode::Wide);
+        assert_eq!(session_table_mode(90), SessionTableMode::Compact);
+        assert_eq!(session_table_mode(60), SessionTableMode::UltraCompact);
+        assert_eq!(
+            detail_layout_mode(Rect::new(0, 0, 120, 30)),
+            DetailLayoutMode::Full
+        );
+        assert_eq!(
+            detail_layout_mode(Rect::new(0, 0, 90, 18)),
+            DetailLayoutMode::Compact
+        );
+        assert_eq!(session_table_height(0), 4);
+        assert_eq!(session_table_height(2), 5);
+        assert_eq!(session_table_height(20), 9);
+    }
+
+    #[test]
+    fn truncate_text_uses_ascii_ellipsis() {
+        assert_eq!(truncate_text("short", 8), "short");
+        assert_eq!(truncate_text("123456789", 8), "12345...");
+        assert_eq!(truncate_text("123456789", 3), "123");
+    }
+
+    #[test]
+    fn status_line_keeps_full_diagnostic_on_wide_terminals() {
+        let mut app = App::new(PathBuf::from("/tmp/moshwatch/api.sock"), 1_000);
+        app.total_sessions = 2;
+        app.last_error =
+            Some("session refresh failed: unix socket response exceeded 4 MiB limit".to_string());
+
+        let status = status_line(160, &app);
+        assert!(
+            status.contains("session refresh failed: unix socket response exceeded 4 MiB limit")
+        );
+        assert!(!status.contains("..."));
+    }
+
+    #[test]
+    fn status_line_truncates_diagnostic_on_narrow_terminals() {
+        let mut app = App::new(PathBuf::from("/tmp/moshwatch/api.sock"), 1_000);
+        app.total_sessions = 2;
+        app.last_error =
+            Some("session refresh failed: unix socket response exceeded 4 MiB limit".to_string());
+
+        let status = status_line(80, &app);
+        assert!(status.contains("session refresh failed:"));
+        assert!(status.contains("..."));
+        assert!(!status.contains("response exceeded 4 MiB limit"));
+        assert!(status.contains("x term | q quit"));
+    }
+
+    #[test]
+    fn status_line_renders_notice_and_error_when_both_are_present() {
+        let rendered = format_status_messages(
+            160,
+            Some("terminate complete"),
+            Some("session refresh failed"),
+        );
+        assert_eq!(rendered, " | terminate complete | session refresh failed");
     }
 
     #[test]

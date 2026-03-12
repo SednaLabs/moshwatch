@@ -60,9 +60,12 @@ jobs:
 
       - name: Install Rust
         if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup component add clippy rustfmt
 
       - name: Cache Rust build artifacts
         if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
