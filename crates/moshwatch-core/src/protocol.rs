@@ -329,6 +329,57 @@ pub struct ApiSessionControlResponse {
     pub action: SessionControlAction,
 }
 
+/// Backward-compatible metrics shape for `GET /v1/config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiMetricsConfig {
+    /// TCP metrics listener address when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
+    /// Whether non-loopback Prometheus binds are allowed.
+    pub allow_non_loopback: bool,
+    /// Prometheus detail tier for local scraping.
+    pub detail_tier: crate::MetricsDetailTier,
+    /// OTLP metrics export configuration.
+    pub otlp: crate::config::OtlpMetricsConfig,
+}
+
+/// Effective daemon configuration shape returned by `GET /v1/config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiAppConfig {
+    pub refresh_ms: u64,
+    pub discovery_interval_ms: u64,
+    pub cleanup_interval_ms: u64,
+    pub history_secs: u64,
+    pub max_tracked_sessions: usize,
+    pub max_session_detail_points: usize,
+    pub thresholds: crate::config::HealthThresholds,
+    pub stream: crate::config::EventStreamConfig,
+    pub persistence: crate::config::PersistenceConfig,
+    pub metrics: ApiMetricsConfig,
+}
+
+impl From<&crate::config::AppConfig> for ApiAppConfig {
+    fn from(config: &crate::config::AppConfig) -> Self {
+        Self {
+            refresh_ms: config.refresh_ms,
+            discovery_interval_ms: config.discovery_interval_ms,
+            cleanup_interval_ms: config.cleanup_interval_ms,
+            history_secs: config.history_secs,
+            max_tracked_sessions: config.max_tracked_sessions,
+            max_session_detail_points: config.max_session_detail_points,
+            thresholds: config.thresholds.clone(),
+            stream: config.stream.clone(),
+            persistence: config.persistence.clone(),
+            metrics: ApiMetricsConfig {
+                listen_addr: config.metrics.prometheus.listen_addr.clone(),
+                allow_non_loopback: config.metrics.prometheus.allow_non_loopback,
+                detail_tier: config.metrics.prometheus.detail_tier,
+                otlp: config.metrics.otlp.clone(),
+            },
+        }
+    }
+}
+
 /// Response body for `GET /v1/config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfigResponse {
@@ -340,7 +391,7 @@ pub struct ApiConfigResponse {
     /// Response generation time in Unix milliseconds.
     pub generated_at_unix_ms: i64,
     /// Effective daemon configuration.
-    pub config: crate::config::AppConfig,
+    pub config: ApiAppConfig,
 }
 
 /// Persisted history sample for one session at one recording point.

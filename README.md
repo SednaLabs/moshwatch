@@ -496,6 +496,7 @@ OTLP/HTTP metrics to the configured collector endpoint. The default shape is:
 - default detail tier: `aggregate_only`
 - additional headers and resource attributes configured under `[metrics.otlp]`
 - `metrics.otlp.headers` must use valid HTTP header syntax; `accept` and `content-type` are reserved by the exporter and rejected if configured explicitly
+- built-in observer identity is included only for `per_session` OTLP; `aggregate_only` omits it unless you explicitly add your own attribution via `metrics.otlp.resource_attributes`
 
 Start from the shipped collector example:
 

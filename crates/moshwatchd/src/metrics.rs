@@ -1041,9 +1041,17 @@ fn encode_otlp_metrics(
     let mut resource_attributes = vec![
         string_attribute("service.name", "moshwatchd"),
         string_attribute("service.version", env!("CARGO_PKG_VERSION")),
-        string_attribute("moshwatch.observer.node_name", &observer.node_name),
-        string_attribute("moshwatch.observer.system_id", &observer.system_id),
     ];
+    if config.metrics.otlp.detail_tier.includes_sessions() {
+        resource_attributes.push(string_attribute(
+            "moshwatch.observer.node_name",
+            &observer.node_name,
+        ));
+        resource_attributes.push(string_attribute(
+            "moshwatch.observer.system_id",
+            &observer.system_id,
+        ));
+    }
     for (key, value) in &config.metrics.otlp.resource_attributes {
         resource_attributes.push(string_attribute(key, value));
     }
@@ -1581,7 +1589,23 @@ mod tests {
             .expect("encode OTLP metrics");
         let request = ExportMetricsServiceRequest::decode(payload.as_slice())
             .expect("decode OTLP metrics payload");
+        let resource_attributes = &request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource")
+            .attributes;
         let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.node_name")
+        );
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.system_id")
+        );
 
         let session_packets = metrics
             .iter()
@@ -1606,5 +1630,64 @@ mod tests {
             unix_nanos(export.sessions[0].started_at_unix_ms)
         );
         assert_eq!(exporter_start, unix_nanos(9_000));
+    }
+
+    #[test]
+    fn aggregate_only_otlp_omits_built_in_observer_identity() {
+        let observer = ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        };
+        let mut config = AppConfig::default();
+        config.metrics.otlp.detail_tier = MetricsDetailTier::AggregateOnly;
+        config.metrics.otlp.resource_attributes.insert(
+            "service.instance.id".to_string(),
+            "collector-host-a".to_string(),
+        );
+        let export = sample_export();
+        let samples = collect_metric_samples(
+            &config,
+            &observer,
+            &export,
+            None,
+            sample_runtime(),
+            &OtlpExporterStatsSnapshot::default(),
+            config.metrics.otlp.detail_tier,
+        );
+        let payload = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
+            .expect("encode OTLP metrics");
+        let request = ExportMetricsServiceRequest::decode(payload.as_slice())
+            .expect("decode OTLP metrics payload");
+        let resource_attributes = &request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource")
+            .attributes;
+
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "service.name")
+        );
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "service.version")
+        );
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "service.instance.id")
+        );
+        assert!(
+            !resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.node_name")
+        );
+        assert!(
+            !resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.system_id")
+        );
     }
 }

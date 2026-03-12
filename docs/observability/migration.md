@@ -66,8 +66,8 @@ The following behavior is unchanged but now documented as part of the contract:
 1. Move config to nested `[metrics.prometheus]` and `[metrics.otlp]` tables.
 2. Update Prometheus dashboards or alert rules to use
    `moshwatch_sessions_by_health` and the OTLP exporter metrics.
-3. If you aggregate across hosts, use `moshwatch_observer_info` or OTLP
-   `service.instance.id` for attribution instead of repeating host labels across
-   every per-session series.
+3. If you aggregate across hosts, use `moshwatch_observer_info` for Prometheus
+   attribution, or set explicit OTLP `metrics.otlp.resource_attributes` such as
+   `service.instance.id` when you need host attribution from aggregate-only OTLP.
 4. Re-run `cargo run --locked -p xtask -- validate-observability-assets` after
    changing repo-owned examples or docs.

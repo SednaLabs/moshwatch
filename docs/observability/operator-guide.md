@@ -75,6 +75,8 @@ Recommended posture:
 
 - keep OTLP disabled until you need it
 - default to `aggregate_only` detail for OTLP
+- aggregate-only OTLP omits built-in observer identity; add explicit
+  `metrics.otlp.resource_attributes` only if you want downstream host attribution
 - prefer HTTPS for remote collectors
 - prefer mTLS or a private network when collector traffic leaves the host
 - treat OTLP headers as secrets and inject them from the environment or your

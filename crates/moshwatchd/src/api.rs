@@ -309,7 +309,7 @@ async fn build_response(
                 schema_version: API_SCHEMA_VERSION,
                 observer: context.observer.clone(),
                 generated_at_unix_ms: now_ms,
-                config: guard.config().clone(),
+                config: guard.config().into(),
             };
             (
                 200,
@@ -858,6 +858,34 @@ mod tests {
             "192.0.2.1:60001"
         );
         assert_eq!(body["sessions"][0]["client_addr"], "192.0.2.1:60001");
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_preserves_flat_metrics_shape() {
+        let tempdir = tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("api.sock");
+        let mut config = AppConfig::default();
+        config.metrics.prometheus.listen_addr = Some("127.0.0.1:2233".to_string());
+        config.metrics.prometheus.allow_non_loopback = true;
+        config.metrics.prometheus.detail_tier = moshwatch_core::MetricsDetailTier::AggregateOnly;
+        config.metrics.otlp.enabled = true;
+        config.metrics.otlp.endpoint = "http://127.0.0.1:4318/v1/metrics".to_string();
+        let state = Arc::new(RwLock::new(ServiceState::new(config)));
+        let snapshots = SnapshotHub::new(observer());
+
+        let task = spawn_api(state, snapshots, None, &socket_path).await;
+        wait_for_socket(&socket_path).await;
+
+        let response = request(&socket_path, "/v1/config").await;
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = json_body(&response);
+        assert_eq!(body["config"]["metrics"]["listen_addr"], "127.0.0.1:2233");
+        assert_eq!(body["config"]["metrics"]["allow_non_loopback"], true);
+        assert_eq!(body["config"]["metrics"]["detail_tier"], "aggregate_only");
+        assert_eq!(body["config"]["metrics"]["otlp"]["enabled"], true);
+        assert!(body["config"]["metrics"].get("prometheus").is_none());
     }
 
     #[tokio::test]

@@ -17,9 +17,9 @@ pub use observability::{
     metric_descriptor,
 };
 pub use protocol::{
-    API_SCHEMA_VERSION, ApiConfigResponse, ApiHistoryResponse, ApiSessionControlResponse,
-    ApiSessionResponse, ApiSessionsResponse, EventStreamEvent, EventStreamFrame, HealthState,
-    HistorySample, MetricPoint, RetransmitWindowBreakdown, SessionControlAction, SessionKind,
-    SessionMetrics, SessionPeerInfo, SessionSnapshot, SessionSummary, TelemetryEvent,
-    TelemetryEventKind, classify_health,
+    API_SCHEMA_VERSION, ApiAppConfig, ApiConfigResponse, ApiHistoryResponse, ApiMetricsConfig,
+    ApiSessionControlResponse, ApiSessionResponse, ApiSessionsResponse, EventStreamEvent,
+    EventStreamFrame, HealthState, HistorySample, MetricPoint, RetransmitWindowBreakdown,
+    SessionControlAction, SessionKind, SessionMetrics, SessionPeerInfo, SessionSnapshot,
+    SessionSummary, TelemetryEvent, TelemetryEventKind, classify_health,
 };
