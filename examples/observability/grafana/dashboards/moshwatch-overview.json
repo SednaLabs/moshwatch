@@ -39,7 +39,7 @@
       },
       "targets": [
         {
-          "expr": "sum(moshwatch_sessions)",
+          "expr": "sum(moshwatch_sessions and on (job, instance) moshwatch_observer_info{system_id=~\"$observer\"})",
           "refId": "A"
         }
       ],
@@ -78,7 +78,7 @@
       },
       "targets": [
         {
-          "expr": "sum(moshwatch_sessions_by_health{kind=\"instrumented\",health=\"critical\"})",
+          "expr": "sum(moshwatch_sessions_by_health{kind=\"instrumented\",health=\"critical\"} and on (job, instance) moshwatch_observer_info{system_id=~\"$observer\"})",
           "refId": "A"
         }
       ],
@@ -112,8 +112,8 @@
       },
       "targets": [
         {
-          "expr": "max by (session_id) (moshwatch_session_srtt_ms)",
-          "legendFormat": "{{session_id}}",
+          "expr": "max by (system_id, session_id) (moshwatch_session_srtt_ms and on (job, instance) moshwatch_observer_info{system_id=~\"$observer\"})",
+          "legendFormat": "{{system_id}} / {{session_id}}",
           "refId": "A"
         }
       ],
@@ -147,7 +147,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (loop) (rate(moshwatch_runtime_loop_overruns_total[5m]))",
+          "expr": "sum by (loop) (rate(moshwatch_runtime_loop_overruns_total[5m]) and on (job, instance) moshwatch_observer_info{system_id=~\"$observer\"})",
           "legendFormat": "{{loop}}",
           "refId": "A"
         }
@@ -182,7 +182,7 @@
       },
       "targets": [
         {
-          "expr": "moshwatch_history_current_bytes",
+          "expr": "moshwatch_history_current_bytes and on (job, instance) moshwatch_observer_info{system_id=~\"$observer\"}",
           "legendFormat": "history bytes",
           "refId": "A"
         }
@@ -217,7 +217,7 @@
       },
       "targets": [
         {
-          "expr": "increase(moshwatch_otlp_exports_total{result=\"failure\"}[15m])",
+          "expr": "increase(moshwatch_otlp_exports_total{result=\"failure\"}[15m]) and on (job, instance) moshwatch_observer_info{system_id=~\"$observer\"}",
           "legendFormat": "failures / 15m",
           "refId": "A"
         }

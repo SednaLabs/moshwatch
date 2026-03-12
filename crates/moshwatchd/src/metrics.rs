@@ -50,6 +50,7 @@ const METRICS_CONNECTION_SLOTS: usize = 64;
 const METRICS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_METRICS_RENDERED_SESSIONS: usize = 256;
 const OTLP_INSTRUMENTATION_SCOPE: &str = "moshwatchd.metrics";
+const MAX_OTLP_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetricsTextFormat {
@@ -62,6 +63,12 @@ struct MetricSample {
     labels: Vec<(&'static str, String)>,
     value: f64,
     start_time_unix_nano: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetricCollectionOptions {
+    detail_tier: MetricsDetailLevel,
+    include_observer_info: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -148,7 +155,10 @@ pub fn render_metrics(
         history,
         runtime,
         &otlp_stats,
-        config.metrics.prometheus.detail_tier,
+        MetricCollectionOptions {
+            detail_tier: config.metrics.prometheus.detail_tier,
+            include_observer_info: true,
+        },
     );
     render_metric_samples(&samples, format)
 }
@@ -238,7 +248,10 @@ pub async fn run_otlp_exporter(
             history.as_ref().map(|store| store.stats_snapshot()),
             runtime_stats.snapshot(),
             &stats.snapshot().await,
-            config.metrics.otlp.detail_tier,
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: config.metrics.otlp.detail_tier.includes_sessions(),
+            },
         );
         let payload = encode_otlp_metrics(
             &observer,
@@ -370,7 +383,7 @@ fn collect_metric_samples(
     history: Option<HistoryStatsSnapshot>,
     runtime: RuntimeStatsSnapshot,
     otlp_stats: &OtlpExporterStatsSnapshot,
-    detail_tier: MetricsDetailLevel,
+    options: MetricCollectionOptions,
 ) -> HashMap<MetricId, Vec<MetricSample>> {
     let mut samples = HashMap::<MetricId, Vec<MetricSample>>::new();
     add_sample(
@@ -379,15 +392,17 @@ fn collect_metric_samples(
         vec![("version", env!("CARGO_PKG_VERSION").to_string())],
         1.0,
     );
-    add_sample(
-        &mut samples,
-        MetricId::ObserverInfo,
-        vec![
-            ("node_name", observer.node_name.clone()),
-            ("system_id", observer.system_id.clone()),
-        ],
-        1.0,
-    );
+    if options.include_observer_info {
+        add_sample(
+            &mut samples,
+            MetricId::ObserverInfo,
+            vec![
+                ("node_name", observer.node_name.clone()),
+                ("system_id", observer.system_id.clone()),
+            ],
+            1.0,
+        );
+    }
     add_sample(
         &mut samples,
         MetricId::Sessions,
@@ -413,12 +428,12 @@ fn collect_metric_samples(
         );
     }
 
-    let rendered_sessions = if detail_tier.includes_sessions() {
+    let rendered_sessions = if options.detail_tier.includes_sessions() {
         export.sessions.len()
     } else {
         0
     };
-    let truncated_sessions = if detail_tier.includes_sessions() {
+    let truncated_sessions = if options.detail_tier.includes_sessions() {
         export.truncated_session_count
     } else {
         0
@@ -594,7 +609,7 @@ fn collect_metric_samples(
         otlp_stats.last_payload_bytes.map(|value| value as f64),
     );
 
-    if detail_tier.includes_sessions() {
+    if options.detail_tier.includes_sessions() {
         for session in &export.sessions {
             let info_labels = session_info_labels(session);
             let value_labels = session_value_labels(session);
@@ -750,25 +765,28 @@ fn collect_metric_samples(
                     .empty_acks_total
                     .map(|value| value as f64),
             );
+            let counter_start_ms = session
+                .counter_reset_unix_ms
+                .unwrap_or(session.started_at_unix_ms);
             add_optional_counter_sample(
                 &mut samples,
                 MetricId::SessionPacketsTxTotal,
                 value_labels.clone(),
-                session.started_at_unix_ms,
+                counter_start_ms,
                 session.metrics.packets_tx_total.map(|value| value as f64),
             );
             add_optional_counter_sample(
                 &mut samples,
                 MetricId::SessionPacketsRxTotal,
                 value_labels.clone(),
-                session.started_at_unix_ms,
+                counter_start_ms,
                 session.metrics.packets_rx_total.map(|value| value as f64),
             );
             add_optional_counter_sample(
                 &mut samples,
                 MetricId::SessionRetransmitsTotal,
                 value_labels,
-                session.started_at_unix_ms,
+                counter_start_ms,
                 session.metrics.retransmits_total.map(|value| value as f64),
             );
         }
@@ -993,7 +1011,7 @@ fn otlp_headers(config: &AppConfig) -> Result<HeaderMap> {
 
 async fn handle_otlp_response(response: reqwest::Response) -> Result<()> {
     let status = response.status();
-    let body = response.bytes().await.context("read OTLP response body")?;
+    let body = read_otlp_response_body(response).await?;
     if !status.is_success() {
         let snippet = String::from_utf8_lossy(&body);
         anyhow::bail!(
@@ -1017,6 +1035,29 @@ async fn handle_otlp_response(response: reqwest::Response) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn read_otlp_response_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length()
+        && length > MAX_OTLP_RESPONSE_BYTES as u64
+    {
+        anyhow::bail!(
+            "collector response body ({} bytes) exceeds {} byte limit",
+            length,
+            MAX_OTLP_RESPONSE_BYTES
+        );
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("read OTLP response chunk")? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_OTLP_RESPONSE_BYTES {
+            anyhow::bail!(
+                "collector response body exceeded {} bytes",
+                MAX_OTLP_RESPONSE_BYTES
+            );
+        }
+    }
+    Ok(body)
 }
 
 fn encode_otlp_metrics(
@@ -1302,9 +1343,10 @@ mod tests {
     use prost::Message;
 
     use super::{
-        MetricsTextFormat, OtlpExporterStatsSnapshot, collect_metric_samples, encode_otlp_metrics,
-        extract_bearer_token, metrics_request_is_authorized, otlp_headers, render_metrics,
-        requested_metrics_format, unix_nanos,
+        MetricCollectionOptions, MetricsTextFormat, OtlpExporterStatsSnapshot,
+        collect_metric_samples, encode_otlp_metrics, extract_bearer_token,
+        metrics_request_is_authorized, otlp_headers, render_metrics, requested_metrics_format,
+        unix_nanos,
     };
     use crate::runtime_stats::RuntimeStatsSnapshot;
     use crate::{
@@ -1378,6 +1420,7 @@ mod tests {
                     ..SessionPeerInfo::default()
                 },
                 cmdline: "mosh-server-real".to_string(),
+                counter_reset_unix_ms: None,
                 metrics: SessionMetrics {
                     srtt_ms: Some(12.5),
                     last_heard_age_ms: Some(250),
@@ -1583,7 +1626,10 @@ mod tests {
             None,
             sample_runtime(),
             &OtlpExporterStatsSnapshot::default(),
-            config.metrics.otlp.detail_tier,
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: true,
+            },
         );
         let payload = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
             .expect("encode OTLP metrics");
@@ -1652,7 +1698,10 @@ mod tests {
             None,
             sample_runtime(),
             &OtlpExporterStatsSnapshot::default(),
-            config.metrics.otlp.detail_tier,
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: false,
+            },
         );
         let payload = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
             .expect("encode OTLP metrics");

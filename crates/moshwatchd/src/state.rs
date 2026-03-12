@@ -142,6 +142,7 @@ impl ServiceState {
                     health: HealthState::Ok,
                     started_at_unix_ms: started_at,
                     last_observed_unix_ms: initial_observed_unix_ms,
+                    counter_reset_unix_ms: None,
                     bind_addr: bind_addr.clone(),
                     udp_port: event.udp_port,
                     client_addr: None,
@@ -163,6 +164,7 @@ impl ServiceState {
                 pid = entry.summary.pid,
                 "reset session history after telemetry counter regression"
             );
+            entry.summary.counter_reset_unix_ms = Some(event_unix_ms);
             entry.history.clear();
             entry.counters.clear();
         } else if entry
@@ -287,6 +289,7 @@ impl ServiceState {
                         health: HealthState::Legacy,
                         started_at_unix_ms: session.started_at_unix_ms,
                         last_observed_unix_ms: now_ms,
+                        counter_reset_unix_ms: None,
                         bind_addr: session.bind_addr.clone(),
                         udp_port: session.udp_port,
                         client_addr: None,
@@ -1093,6 +1096,7 @@ mod tests {
         assert_eq!(detail.history.len(), 1);
         assert_eq!(detail.summary.metrics.retransmit_pct_10s, None);
         assert!(!detail.summary.metrics.retransmit_window_10s_complete);
+        assert_eq!(detail.summary.counter_reset_unix_ms, Some(13_000));
     }
 
     #[test]

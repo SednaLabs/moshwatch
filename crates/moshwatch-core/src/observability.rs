@@ -48,6 +48,7 @@ pub enum MetricPrivacy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricLabelSchema {
     None,
+    BuildVersion,
     Observer,
     Kind,
     KindHealth,
@@ -128,7 +129,7 @@ pub const METRIC_CATALOG: &[MetricDescriptor] = &[
         unit: "1",
         cardinality: MetricCardinality::Static,
         privacy: MetricPrivacy::FleetSafe,
-        labels: MetricLabelSchema::None,
+        labels: MetricLabelSchema::BuildVersion,
         minimum_detail_tier: MetricsDetailTier::AggregateOnly,
     },
     MetricDescriptor {

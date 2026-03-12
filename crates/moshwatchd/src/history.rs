@@ -703,6 +703,7 @@ mod tests {
             },
             cmdline: "mosh-server-real".to_string(),
             metrics: SessionMetrics::default(),
+            counter_reset_unix_ms: None,
         }
     }
 

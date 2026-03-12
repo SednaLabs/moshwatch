@@ -602,6 +602,7 @@ fn privacy_name(privacy: MetricPrivacy) -> &'static str {
 fn label_schema_name(labels: MetricLabelSchema) -> &'static str {
     match labels {
         MetricLabelSchema::None => "none",
+        MetricLabelSchema::BuildVersion => "version",
         MetricLabelSchema::Observer => "observer",
         MetricLabelSchema::Kind => "kind",
         MetricLabelSchema::KindHealth => "kind,health",

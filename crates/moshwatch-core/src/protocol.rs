@@ -171,6 +171,9 @@ pub struct SessionSummary {
     pub started_at_unix_ms: i64,
     /// Last time this session was observed by telemetry or discovery.
     pub last_observed_unix_ms: i64,
+    /// When telemetry counters were last reset during this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_reset_unix_ms: Option<i64>,
     /// Bound local address when known.
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
@@ -340,6 +343,7 @@ pub struct ApiMetricsConfig {
     /// Prometheus detail tier for local scraping.
     pub detail_tier: crate::MetricsDetailTier,
     /// OTLP metrics export configuration.
+    #[serde(default)]
     pub otlp: crate::config::OtlpMetricsConfig,
 }
 
@@ -355,7 +359,19 @@ pub struct ApiAppConfig {
     pub thresholds: crate::config::HealthThresholds,
     pub stream: crate::config::EventStreamConfig,
     pub persistence: crate::config::PersistenceConfig,
+    #[serde(default)]
     pub metrics: ApiMetricsConfig,
+}
+
+impl Default for ApiMetricsConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: None,
+            allow_non_loopback: false,
+            detail_tier: crate::MetricsDetailTier::PerSession,
+            otlp: crate::config::OtlpMetricsConfig::default(),
+        }
+    }
 }
 
 impl From<&crate::config::AppConfig> for ApiAppConfig {

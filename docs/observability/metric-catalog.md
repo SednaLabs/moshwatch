@@ -6,7 +6,7 @@ This file is generated from `crates/moshwatch-core/src/observability.rs`. It is 
 
 | Metric | Type | Unit | Labels | Minimum Detail Tier | Privacy | Cardinality | Description |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `moshwatch_build_info` | `info` | `1` | `none` | `aggregate_only` | `fleet_safe` | `static` | Build information for moshwatchd. |
+| `moshwatch_build_info` | `info` | `1` | `version` | `aggregate_only` | `fleet_safe` | `static` | Build information for moshwatchd. |
 | `moshwatch_observer_info` | `info` | `1` | `observer` | `aggregate_only` | `operator_sensitive` | `static` | Host identity for this moshwatchd instance. |
 | `moshwatch_sessions` | `gauge` | `1` | `kind` | `aggregate_only` | `fleet_safe` | `low` | Number of sessions by kind. |
 | `moshwatch_sessions_by_health` | `gauge` | `1` | `kind,health` | `aggregate_only` | `fleet_safe` | `low` | Number of sessions by kind and derived health state. |
