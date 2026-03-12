@@ -1784,6 +1784,7 @@ mod tests {
             health: HealthState::Ok,
             started_at_unix_ms: 1,
             last_observed_unix_ms: 2,
+            counter_reset_unix_ms: None,
             bind_addr: None,
             udp_port: None,
             client_addr: None,
