@@ -578,7 +578,7 @@ upsert_managed_block() {{
     local tmp_file
     local next_file
     tmp_file="$(mktemp "$(dirname -- "$file_path")/.${{file_path##*/}}.XXXXXX")"
-    next_file="$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+    next_file="$(mktemp "$(dirname -- "$file_path")/.${{file_path##*/}}.next.XXXXXX")"
 
     if [[ -f "$file_path" ]]; then
         awk -v start="$PATH_BLOCK_START" -v end="$PATH_BLOCK_END" '
@@ -1587,7 +1587,17 @@ mod tests {
     fn upsert_managed_block_preserves_symlinked_rc_file() {
         let tempdir = tempdir().expect("tempdir");
         let path = tempdir.path().join(".bashrc");
-        let next_file = tempdir.path().join(".bashrc.next");
+        let stale_next = tempdir
+            .path()
+            .read_dir()
+            .expect("dir entries")
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".bashrc.next")
+            });
         let target = tempdir.path().join("dotfiles/.bashrc");
         fs::create_dir_all(target.parent().expect("target parent")).expect("create target dir");
         fs::write(&target, "existing\n").expect("write target");
@@ -1606,7 +1616,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).expect("read target"), expected);
         assert_eq!(fs::read_to_string(&path).expect("read symlink"), expected);
         assert!(
-            !next_file.exists(),
+            stale_next.is_none(),
             "symlink update must not leave a .next artifact"
         );
     }
@@ -1616,9 +1626,9 @@ mod tests {
         let script = render_release_install_script();
 
         assert!(script.contains("local next_file"));
-        assert!(
-            script.contains("next_file=\"$(dirname -- \"$file_path\")/.${file_path##*/}.next\"")
-        );
+        assert!(script.contains(
+            r#"next_file="$(mktemp "$(dirname -- "$file_path")/.${file_path##*/}.next.XXXXXX")""#
+        ));
         assert!(script.contains("if [[ -L \"$file_path\" ]]; then"));
         assert!(script.contains("cat \"$next_file\" > \"$file_path\""));
         assert!(script.contains("mv \"$next_file\" \"$file_path\""));
