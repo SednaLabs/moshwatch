@@ -1146,6 +1146,7 @@ fn encode_otlp_metrics(
     let mut resource_attributes = vec![
         string_attribute("service.name", "moshwatchd"),
         string_attribute("service.version", env!("CARGO_PKG_VERSION")),
+        string_attribute("service.instance.id", &observer.system_id),
     ];
     if config.metrics.otlp.detail_tier.includes_sessions() {
         resource_attributes.push(string_attribute(
@@ -1402,7 +1403,8 @@ mod tests {
         SessionMetrics, SessionPeerInfo, SessionSummary,
     };
     use opentelemetry_proto::tonic::{
-        collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::metric,
+        collector::metrics::v1::ExportMetricsServiceRequest, common::v1::any_value::Value,
+        metrics::v1::metric,
     };
     use prost::Message;
 
@@ -1804,17 +1806,13 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_only_otlp_omits_built_in_observer_identity() {
+    fn aggregate_only_otlp_includes_stable_instance_identity() {
         let observer = ObserverInfo {
             node_name: "node-1".to_string(),
             system_id: "system-1".to_string(),
         };
         let mut config = AppConfig::default();
         config.metrics.otlp.detail_tier = MetricsDetailTier::AggregateOnly;
-        config.metrics.otlp.resource_attributes.insert(
-            "service.instance.id".to_string(),
-            "collector-host-a".to_string(),
-        );
         let export = sample_export();
         let samples = collect_metric_samples(
             &config,
@@ -1853,6 +1851,13 @@ mod tests {
                 .iter()
                 .any(|attr| attr.key == "service.instance.id")
         );
+        assert!(resource_attributes.iter().any(|attr| {
+            attr.key == "service.instance.id"
+                && matches!(
+                    attr.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value == "system-1"
+                )
+        }));
         assert!(
             !resource_attributes
                 .iter()

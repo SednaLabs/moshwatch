@@ -33,6 +33,10 @@ jobs:
             while IFS= read -r path; do
               [[ -z "$path" ]] && continue
               case "$path" in
+                docs/observability/metric-catalog.md)
+                  docs_only=false
+                  break
+                  ;;
                 *.md|docs/*|LICENSE|NOTICE|LICENSES.md)
                   ;;
                 *)
