@@ -159,44 +159,67 @@ impl AcceptPreference {
 fn accept_header_preference(value: &str) -> AcceptPreference {
     let mut preference = AcceptPreference::default();
     for item in value.split(',') {
-        let Some((media_type, quality)) = accept_item_quality(item) else {
-            continue;
-        };
-        if media_type.eq_ignore_ascii_case("application/openmetrics-text") {
+        if let Some(quality) = accept_item_quality(
+            item,
+            "application/openmetrics-text",
+            OPENMETRICS_TEXT_VERSION,
+        ) {
             preference.openmetrics_quality = preference.openmetrics_quality.max(quality);
-        } else if media_type.eq_ignore_ascii_case("text/plain") {
+        }
+        if let Some(quality) = accept_item_quality(item, "text/plain", PROMETHEUS_TEXT_VERSION) {
             preference.text_plain_quality = preference.text_plain_quality.max(quality);
         }
     }
     preference
 }
 
-fn accept_item_quality(item: &str) -> Option<(&str, f32)> {
+const PROMETHEUS_TEXT_VERSION: &str = "0.0.4";
+const OPENMETRICS_TEXT_VERSION: &str = "1.0.0";
+
+fn accept_item_quality(
+    item: &str,
+    expected_media_type: &str,
+    expected_version: &str,
+) -> Option<f32> {
     let mut parts = item.split(';');
     let media_type = parts.next().map(str::trim)?;
     if media_type.is_empty() {
         return None;
-    };
+    }
+    if !media_type.eq_ignore_ascii_case(expected_media_type) {
+        return None;
+    }
 
     let mut quality = 1.0_f32;
+    let mut version = None;
     for parameter in parts {
         let Some((name, raw_value)) = parameter.split_once('=') else {
             continue;
         };
-        if !name.trim().eq_ignore_ascii_case("q") {
+        let name = name.trim();
+        let value = raw_value.trim().trim_matches('"');
+        if name.eq_ignore_ascii_case("q") {
+            let Ok(parsed) = value.parse::<f32>() else {
+                return None;
+            };
+            if !(0.0..=1.0).contains(&parsed) {
+                return None;
+            }
+            quality = parsed;
             continue;
         }
-        let Ok(parsed) = raw_value.trim().trim_matches('"').parse::<f32>() else {
-            return None;
-        };
-        if !(0.0..=1.0).contains(&parsed) {
-            return None;
+        if name.eq_ignore_ascii_case("version") {
+            version = Some(value);
         }
-        quality = parsed;
-        break;
     }
 
-    Some((media_type, quality))
+    if let Some(version) = version
+        && version != expected_version
+    {
+        return None;
+    }
+
+    Some(quality)
 }
 
 pub fn render_metrics(
@@ -217,7 +240,7 @@ pub fn render_metrics(
         &otlp_stats,
         MetricCollectionOptions {
             detail_tier: config.metrics.prometheus.detail_tier,
-            include_observer_info: true,
+            include_observer_info: config.metrics.prometheus.detail_tier.includes_sessions(),
         },
     );
     render_metric_samples(&samples, format)
@@ -1555,6 +1578,7 @@ mod tests {
         assert!(metrics.contains("window=\"10s\""));
         assert!(metrics.contains("moshwatch_session_retransmit_window_transmissions"));
         assert!(metrics.contains("moshwatch_session_retransmit_window_retransmits"));
+        assert!(metrics.contains("moshwatch_observer_info"));
         assert!(metrics.contains("moshwatch_metrics_truncated_sessions 2"));
         assert!(metrics.contains("moshwatch_runtime_dropped_sessions_total 7"));
         assert!(metrics.contains("moshwatch_runtime_worker_threads 2"));
@@ -1591,6 +1615,7 @@ mod tests {
 
         assert!(metrics.contains("moshwatch_sessions{kind=\"instrumented\"} 1"));
         assert!(metrics.contains("moshwatch_metrics_rendered_sessions 0"));
+        assert!(!metrics.contains("moshwatch_observer_info"));
         assert!(!metrics.contains("moshwatch_session_srtt_ms"));
         assert!(!metrics.contains("moshwatch_session_info"));
     }
@@ -1619,6 +1644,24 @@ mod tests {
         assert_eq!(
             requested_metrics_format(request),
             MetricsTextFormat::PrometheusText
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_version_mismatch_does_not_win_negotiation() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; version=0.0.1, text/plain; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            MetricsTextFormat::PrometheusText
+        );
+    }
+
+    #[test]
+    fn prometheus_accept_version_mismatch_does_not_win_negotiation() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; version=1.0.0, application/openmetrics-text; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            MetricsTextFormat::OpenMetricsText
         );
     }
 
