@@ -623,7 +623,8 @@ upsert_managed_block() {{
         fi
     fi
 
-    mv "$(dirname -- "$file_path")/.${{file_path##*/}}.next" "$file_path"
+    # Write through the managed path so symlinked rc files keep the link itself.
+    cat "$(dirname -- "$file_path")/.${{file_path##*/}}.next" > "$file_path"
     rm -f "$tmp_file"
 }}
 
@@ -1597,6 +1598,20 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&target).expect("read target"), expected);
         assert_eq!(fs::read_to_string(&path).expect("read symlink"), expected);
+    }
+
+    #[test]
+    fn render_release_install_script_preserves_symlinked_rc_files() {
+        let script = render_release_install_script();
+
+        assert!(script.contains(
+            "cat \"$(dirname -- \"$file_path\")/.${file_path##*/}.next\" > \"$file_path\""
+        ));
+        assert!(
+            !script.contains(
+                "mv \"$(dirname -- \"$file_path\")/.${file_path##*/}.next\" \"$file_path\""
+            )
+        );
     }
 
     #[test]
