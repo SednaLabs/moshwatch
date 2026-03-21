@@ -141,6 +141,17 @@ jobs:
       - name: Build instrumented artifacts
         run: cargo run --locked -p xtask -- build
 
+      - name: Derive release tag
+        id: release-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="$(python3 -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          echo "tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release assets
+        run: cargo run --locked -p xtask -- package-release --tag "${{ steps.release-tag.outputs.tag }}"
+
       - name: Upload dist/bin artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
