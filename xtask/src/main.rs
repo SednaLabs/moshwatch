@@ -18,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use flate2::{Compression, write::GzEncoder};
+use flate2::{Compression, GzBuilder, write::GzEncoder};
 use moshwatch_core::{
     AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy, MetricsDetailTier,
     metric_catalog,
@@ -26,7 +26,7 @@ use moshwatch_core::{
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use sha2::{Digest, Sha256};
-use tar::Builder as TarBuilder;
+use tar::{Builder as TarBuilder, EntryType, Header};
 use tempfile::NamedTempFile;
 
 const PATH_BLOCK_START: &str = "# >>> moshwatch path >>>";
@@ -254,7 +254,11 @@ fn package_release(tag: String) -> Result<()> {
             tool_versions: collect_tool_versions(&vendor_build_env)?,
         },
     )?;
-    write_binary_archive(&artifact_paths.stage_dir, &artifact_paths.binary_tarball)?;
+    write_binary_archive(
+        &artifact_paths.stage_dir,
+        &artifact_paths.binary_tarball,
+        source_metadata.source_date_epoch,
+    )?;
     write_source_archive(&root, &tag, &source_ref, &artifact_paths.source_tarball)?;
     write_sha256_sums(
         &artifact_paths.sha256_sums,
@@ -634,15 +638,18 @@ systemctl --user restart moshwatchd.service
     )
 }
 
-fn write_binary_archive(stage_dir: &Path, destination: &Path) -> Result<()> {
+fn write_binary_archive(
+    stage_dir: &Path,
+    destination: &Path,
+    source_date_epoch: u64,
+) -> Result<()> {
     let stage_name = stage_dir
         .file_name()
         .context("determine release stage directory name")?
         .to_string_lossy()
         .to_string();
     write_tar_gz(destination, |tar| {
-        tar.append_dir_all(&stage_name, stage_dir)
-            .with_context(|| format!("append release tree {}", stage_dir.display()))
+        append_normalized_release_tree(tar, stage_dir, Path::new(&stage_name), source_date_epoch)
     })
 }
 
@@ -676,7 +683,9 @@ where
     install_file_with_temporary(destination, 0o644, |temporary| {
         let temporary_path = temporary.path().to_path_buf();
         let file = temporary.as_file_mut();
-        let encoder = GzEncoder::new(file, Compression::default());
+        let encoder = GzBuilder::new()
+            .mtime(0)
+            .write(file, Compression::default());
         let mut tar = TarBuilder::new(encoder);
         write_archive(&mut tar)?;
         let encoder = tar
@@ -688,6 +697,94 @@ where
         file.flush()
             .with_context(|| format!("flush {}", temporary_path.display()))
     })
+}
+
+fn append_normalized_release_tree<W: Write>(
+    tar: &mut TarBuilder<W>,
+    stage_dir: &Path,
+    stage_name: &Path,
+    source_date_epoch: u64,
+) -> Result<()> {
+    append_normalized_directory(tar, stage_name, source_date_epoch)?;
+    let mut entries = Vec::new();
+    collect_release_tree_entries(stage_dir, stage_dir, &mut entries)?;
+    entries.sort();
+    for relative_path in entries {
+        let path = stage_dir.join(&relative_path);
+        let archive_path = stage_name.join(&relative_path);
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if metadata.is_dir() {
+            append_normalized_directory(tar, &archive_path, source_date_epoch)?;
+        } else if metadata.is_file() {
+            append_normalized_file(tar, &path, &archive_path, &metadata, source_date_epoch)?;
+        } else {
+            anyhow::bail!("unsupported release tree entry {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn collect_release_tree_entries(
+    root: &Path,
+    current: &Path,
+    entries: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let mut children = fs::read_dir(current)
+        .with_context(|| format!("read release tree directory {}", current.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("list release tree directory {}", current.display()))?;
+    children.sort();
+    for path in children {
+        let relative_path = path
+            .strip_prefix(root)
+            .with_context(|| format!("strip release tree prefix {}", path.display()))?
+            .to_path_buf();
+        entries.push(relative_path);
+        if path.is_dir() {
+            collect_release_tree_entries(root, &path, entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_normalized_directory<W: Write>(
+    tar: &mut TarBuilder<W>,
+    path_in_archive: &Path,
+    source_date_epoch: u64,
+) -> Result<()> {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Directory);
+    header.set_size(0);
+    header.set_mode(0o755);
+    header.set_mtime(source_date_epoch);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+    tar.append_data(&mut header, path_in_archive, io::empty())
+        .with_context(|| format!("append release directory {}", path_in_archive.display()))
+}
+
+fn append_normalized_file<W: Write>(
+    tar: &mut TarBuilder<W>,
+    path_on_disk: &Path,
+    path_in_archive: &Path,
+    metadata: &fs::Metadata,
+    source_date_epoch: u64,
+) -> Result<()> {
+    let mut header = Header::new_gnu();
+    header.set_entry_type(EntryType::Regular);
+    header.set_size(metadata.len());
+    header.set_mode(file_mode_or_default(path_on_disk, 0o644));
+    header.set_mtime(source_date_epoch);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+    let mut file =
+        fs::File::open(path_on_disk).with_context(|| format!("open {}", path_on_disk.display()))?;
+    tar.append_data(&mut header, path_in_archive, &mut file)
+        .with_context(|| format!("append release file {}", path_on_disk.display()))
 }
 
 fn write_sha256_sums(destination: &Path, files: &[&Path]) -> Result<()> {
@@ -1421,6 +1518,8 @@ mod tests {
         fs,
         os::unix::{fs::PermissionsExt, fs::symlink},
         path::Path,
+        thread,
+        time::Duration,
     };
 
     use tempfile::tempdir;
@@ -1430,8 +1529,8 @@ mod tests {
         install_text_file, local_build_source_date_epoch_from, release_artifact_paths,
         render_release_install_script, render_template, sha256_hex, stage_release_tree,
         strip_managed_block, tool_command_from_environment, upsert_managed_block,
-        validate_release_tree, vendored_build_environment_from, write_mosh_server_build_info,
-        write_sha256_sums,
+        validate_release_tree, vendored_build_environment_from, write_binary_archive,
+        write_mosh_server_build_info, write_sha256_sums,
     };
 
     #[test]
@@ -1537,6 +1636,34 @@ mod tests {
     }
 
     #[test]
+    fn write_binary_archive_normalizes_metadata_and_is_reproducible() {
+        let tempdir = tempdir().expect("tempdir");
+        let source_date_epoch = 1_701_234_567;
+        let first_stage = tempdir.path().join("first/moshwatch-v1.2.3-linux-x86_64");
+        let second_stage = tempdir.path().join("second/moshwatch-v1.2.3-linux-x86_64");
+        let first_archive = tempdir.path().join("first.tar.gz");
+        let second_archive = tempdir.path().join("second.tar.gz");
+
+        populate_release_tree(&first_stage);
+        write_binary_archive(&first_stage, &first_archive, source_date_epoch)
+            .expect("write first archive");
+
+        thread::sleep(Duration::from_secs(1));
+        populate_release_tree(&second_stage);
+        write_binary_archive(&second_stage, &second_archive, source_date_epoch)
+            .expect("write second archive");
+
+        assert_eq!(
+            sha256_hex(&first_archive).expect("hash first archive"),
+            sha256_hex(&second_archive).expect("hash second archive")
+        );
+
+        let mtimes = archive_entry_mtimes(&first_archive);
+        assert!(!mtimes.is_empty(), "archive should contain entries");
+        assert!(mtimes.iter().all(|(_, mtime)| *mtime == source_date_epoch));
+    }
+
+    #[test]
     fn vendored_build_environment_pins_reproducibility_and_preserves_tool_overrides() {
         let environment = vendored_build_environment_from(1_701_234_567, |key| match key {
             "CXX" => Some("clang++".into()),
@@ -1559,6 +1686,76 @@ mod tests {
         assert_eq!(environment["CFLAGS"], "-O2");
         assert_eq!(environment["ARFLAGS"], "crs");
         assert_eq!(environment["SOURCE_DATE_EPOCH"], "1701234567");
+    }
+
+    fn populate_release_tree(stage_dir: &Path) {
+        fs::create_dir_all(stage_dir.join("bin")).expect("create bin dir");
+        fs::create_dir_all(stage_dir.join("templates")).expect("create templates dir");
+        fs::create_dir_all(stage_dir.join("licenses/vendor-mosh"))
+            .expect("create vendor license dir");
+
+        for (path, contents) in [
+            ("bin/mosh-server-real", b"server-real".as_slice()),
+            ("bin/moshwatchd", b"daemon".as_slice()),
+            ("bin/moshwatch", b"ui".as_slice()),
+            ("README.md", b"readme".as_slice()),
+            ("LICENSE", b"license".as_slice()),
+            ("NOTICE", b"notice".as_slice()),
+            ("LICENSES.md", b"licenses".as_slice()),
+            ("install.sh", b"#!/usr/bin/env bash\n".as_slice()),
+            (
+                "templates/mosh-server-wrapper.sh",
+                b"ExecStart=moshwatchd\n".as_slice(),
+            ),
+            (
+                "templates/moshwatchd.service",
+                b"[Service]\nExecStart=moshwatchd\n".as_slice(),
+            ),
+            ("licenses/vendor-mosh/AUTHORS", b"authors".as_slice()),
+            ("licenses/vendor-mosh/COPYING", b"copying".as_slice()),
+            (
+                "licenses/vendor-mosh/COPYING.iOS",
+                b"copying-ios".as_slice(),
+            ),
+            (
+                "licenses/vendor-mosh/README.md",
+                b"vendor readme".as_slice(),
+            ),
+        ] {
+            fs::write(stage_dir.join(path), contents).expect("write release tree file");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(
+                stage_dir.join("install.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod install.sh");
+            for binary in ["bin/mosh-server-real", "bin/moshwatchd", "bin/moshwatch"] {
+                fs::set_permissions(stage_dir.join(binary), fs::Permissions::from_mode(0o755))
+                    .expect("chmod binary");
+            }
+        }
+    }
+
+    fn archive_entry_mtimes(path: &Path) -> Vec<(String, u64)> {
+        let file = fs::File::open(path).expect("open archive");
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        let mut mtimes = Vec::new();
+        for entry in archive.entries().expect("list archive entries") {
+            let entry = entry.expect("read archive entry");
+            let path = entry
+                .path()
+                .expect("read archive entry path")
+                .to_string_lossy()
+                .into_owned();
+            let mtime = entry.header().mtime().expect("read archive entry mtime");
+            mtimes.push((path, mtime));
+        }
+        mtimes
     }
 
     #[test]
