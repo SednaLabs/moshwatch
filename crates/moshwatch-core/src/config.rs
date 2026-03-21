@@ -222,17 +222,6 @@ impl<'de> Deserialize<'de> for MetricsConfig {
     {
         let compat = MetricsConfigCompat::deserialize(deserializer)?;
         let mut prometheus = PrometheusMetricsConfig::default();
-        if let Some(prometheus_override) = compat.prometheus {
-            if let Some(listen_addr_override) = prometheus_override.listen_addr {
-                prometheus.listen_addr = listen_addr_override;
-            }
-            if let Some(allow_non_loopback) = prometheus_override.allow_non_loopback {
-                prometheus.allow_non_loopback = allow_non_loopback;
-            }
-            if let Some(detail_tier) = prometheus_override.detail_tier {
-                prometheus.detail_tier = detail_tier;
-            }
-        }
         if let Some(listen_addr) = compat.listen_addr {
             prometheus.listen_addr = if listen_addr.trim().is_empty() {
                 None
@@ -245,6 +234,17 @@ impl<'de> Deserialize<'de> for MetricsConfig {
         }
         if let Some(detail_tier) = compat.detail_tier {
             prometheus.detail_tier = detail_tier;
+        }
+        if let Some(prometheus_override) = compat.prometheus {
+            if let Some(listen_addr_override) = prometheus_override.listen_addr {
+                prometheus.listen_addr = listen_addr_override;
+            }
+            if let Some(allow_non_loopback) = prometheus_override.allow_non_loopback {
+                prometheus.allow_non_loopback = allow_non_loopback;
+            }
+            if let Some(detail_tier) = prometheus_override.detail_tier {
+                prometheus.detail_tier = detail_tier;
+            }
         }
         Ok(Self {
             prometheus,
@@ -1165,6 +1165,58 @@ detail_tier = "aggregate_only"
         assert_eq!(
             parsed.metrics.prometheus.detail_tier,
             MetricsDetailTier::AggregateOnly
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_nested_metrics_prefers_nested_conflicts() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics]
+listen_addr = "127.0.0.1:2233"
+allow_non_loopback = false
+detail_tier = "per_session"
+
+[metrics.prometheus]
+listen_addr = "127.0.0.1:9948"
+allow_non_loopback = true
+detail_tier = "aggregate_only"
+"#,
+        )
+        .expect("parse mixed legacy+nested metrics config");
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:9948")
+        );
+        assert!(parsed.metrics.prometheus.allow_non_loopback);
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::AggregateOnly
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_nested_metrics_keeps_legacy_for_non_conflicting_fields() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics]
+listen_addr = "127.0.0.1:2233"
+allow_non_loopback = true
+detail_tier = "aggregate_only"
+
+[metrics.prometheus]
+detail_tier = "per_session"
+"#,
+        )
+        .expect("parse mixed metrics config with partial nested overrides");
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:2233")
+        );
+        assert!(parsed.metrics.prometheus.allow_non_loopback);
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::PerSession
         );
     }
 
