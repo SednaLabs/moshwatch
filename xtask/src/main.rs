@@ -18,10 +18,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use flate2::{write::GzEncoder, Compression, GzBuilder};
+use flate2::{Compression, GzBuilder, write::GzEncoder};
 use moshwatch_core::{
-    metric_catalog, AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy,
-    MetricsDetailTier,
+    AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy, MetricsDetailTier,
+    metric_catalog,
 };
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
@@ -1517,7 +1517,7 @@ mod tests {
     use std::{
         cell::Cell,
         fs,
-        os::unix::{fs::symlink, fs::PermissionsExt},
+        os::unix::{fs::PermissionsExt, fs::symlink},
         path::Path,
         thread,
         time::Duration,
@@ -1526,12 +1526,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        install_binary, install_text_file, local_build_source_date_epoch_from,
-        release_artifact_paths, render_release_install_script, render_template, sha256_hex,
-        stage_release_tree, strip_managed_block, tool_command_from_environment,
-        upsert_managed_block, validate_release_tree, vendored_build_environment_from,
-        write_binary_archive, write_mosh_server_build_info, write_sha256_sums, MoshServerBuildInfo,
-        Placement, PATH_BLOCK_END, PATH_BLOCK_START,
+        MoshServerBuildInfo, PATH_BLOCK_END, PATH_BLOCK_START, Placement, install_binary,
+        install_text_file, local_build_source_date_epoch_from, release_artifact_paths,
+        render_release_install_script, render_template, sha256_hex, stage_release_tree,
+        strip_managed_block, tool_command_from_environment, upsert_managed_block,
+        validate_release_tree, vendored_build_environment_from, write_binary_archive,
+        write_mosh_server_build_info, write_sha256_sums,
     };
 
     #[test]
