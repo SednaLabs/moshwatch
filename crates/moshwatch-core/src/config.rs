@@ -120,6 +120,19 @@ impl Default for PrometheusMetricsConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct PrometheusMetricsConfigPartial {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_listen_addr_optional"
+    )]
+    listen_addr: Option<Option<String>>,
+    #[serde(default)]
+    allow_non_loopback: Option<bool>,
+    detail_tier: Option<MetricsDetailTier>,
+}
+
 fn deserialize_optional_listen_addr<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -130,6 +143,22 @@ where
             None
         } else {
             Some(listen_addr)
+        }
+    }))
+}
+
+fn deserialize_optional_listen_addr_optional<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let listen_addr = Option::<String>::deserialize(deserializer)?;
+    Ok(listen_addr.map(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
         }
     }))
 }
@@ -179,7 +208,7 @@ pub struct MetricsConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct MetricsConfigCompat {
-    prometheus: Option<PrometheusMetricsConfig>,
+    prometheus: Option<PrometheusMetricsConfigPartial>,
     otlp: Option<OtlpMetricsConfig>,
     listen_addr: Option<String>,
     allow_non_loopback: Option<bool>,
@@ -192,7 +221,18 @@ impl<'de> Deserialize<'de> for MetricsConfig {
         D: serde::Deserializer<'de>,
     {
         let compat = MetricsConfigCompat::deserialize(deserializer)?;
-        let mut prometheus = compat.prometheus.unwrap_or_default();
+        let mut prometheus = PrometheusMetricsConfig::default();
+        if let Some(prometheus_override) = compat.prometheus {
+            if let Some(listen_addr_override) = prometheus_override.listen_addr {
+                prometheus.listen_addr = listen_addr_override;
+            }
+            if let Some(allow_non_loopback) = prometheus_override.allow_non_loopback {
+                prometheus.allow_non_loopback = allow_non_loopback;
+            }
+            if let Some(detail_tier) = prometheus_override.detail_tier {
+                prometheus.detail_tier = detail_tier;
+            }
+        }
         if let Some(listen_addr) = compat.listen_addr {
             prometheus.listen_addr = if listen_addr.trim().is_empty() {
                 None
@@ -1077,6 +1117,33 @@ deployment_environment = "lab"
                 .map(String::as_str),
             Some("lab")
         );
+    }
+
+    #[test]
+    fn partial_metrics_prometheus_table_keeps_default_listener() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics.prometheus]
+detail_tier = "aggregate_only"
+            "#,
+        )
+        .expect("parse partial metrics table");
+
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:9947")
+        );
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::AggregateOnly
+        );
+    }
+
+    #[test]
+    fn partial_metrics_prometheus_table_can_disable_listener() {
+        let parsed: AppConfig = toml::from_str("[metrics.prometheus]\nlisten_addr = \"\"\n")
+            .expect("parse table disabling listener");
+        assert!(parsed.metrics.prometheus.listen_addr.is_none());
     }
 
     #[test]
