@@ -576,7 +576,9 @@ upsert_managed_block() {{
     local file_path="$1"
     local placement="$2"
     local tmp_file
+    local next_file
     tmp_file="$(mktemp "$(dirname -- "$file_path")/.${{file_path##*/}}.XXXXXX")"
+    next_file="$(dirname -- "$file_path")/.${{file_path##*/}}.next"
 
     if [[ -f "$file_path" ]]; then
         awk -v start="$PATH_BLOCK_START" -v end="$PATH_BLOCK_END" '
@@ -597,13 +599,13 @@ upsert_managed_block() {{
                 printf '%s\n' "$PATH_BLOCK_END"
                 printf '\n'
                 cat "$tmp_file"
-            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+            }} > "$next_file"
         else
             {{
                 printf '%s\n' "$PATH_BLOCK_START"
                 printf '[ -r "$HOME/.config/moshwatch/path.sh" ] && . "$HOME/.config/moshwatch/path.sh"\n'
                 printf '%s\n' "$PATH_BLOCK_END"
-            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+            }} > "$next_file"
         fi
     else
         if [[ -s "$tmp_file" ]]; then
@@ -613,23 +615,23 @@ upsert_managed_block() {{
                 printf '%s\n' "$PATH_BLOCK_START"
                 printf '[ -r "$HOME/.config/moshwatch/path.sh" ] && . "$HOME/.config/moshwatch/path.sh"\n'
                 printf '%s\n' "$PATH_BLOCK_END"
-            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+            }} > "$next_file"
         else
             {{
                 printf '%s\n' "$PATH_BLOCK_START"
                 printf '[ -r "$HOME/.config/moshwatch/path.sh" ] && . "$HOME/.config/moshwatch/path.sh"\n'
                 printf '%s\n' "$PATH_BLOCK_END"
-            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+            }} > "$next_file"
         fi
     fi
 
     if [[ -L "$file_path" ]]; then
         # Write through the managed path so symlinked rc files keep the link itself.
-        cat "$(dirname -- "$file_path")/.${{file_path##*/}}.next" > "$file_path"
+        cat "$next_file" > "$file_path"
     else
-        mv "$(dirname -- "$file_path")/.${{file_path##*/}}.next" "$file_path"
+        mv "$next_file" "$file_path"
     fi
-    rm -f "$tmp_file"
+    rm -f "$tmp_file" "$next_file"
 }}
 
 upsert_managed_block "$HOME/.bashrc" prepend
@@ -1585,6 +1587,7 @@ mod tests {
     fn upsert_managed_block_preserves_symlinked_rc_file() {
         let tempdir = tempdir().expect("tempdir");
         let path = tempdir.path().join(".bashrc");
+        let next_file = tempdir.path().join(".bashrc.next");
         let target = tempdir.path().join("dotfiles/.bashrc");
         fs::create_dir_all(target.parent().expect("target parent")).expect("create target dir");
         fs::write(&target, "existing\n").expect("write target");
@@ -1602,21 +1605,24 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&target).expect("read target"), expected);
         assert_eq!(fs::read_to_string(&path).expect("read symlink"), expected);
+        assert!(
+            !next_file.exists(),
+            "symlink update must not leave a .next artifact"
+        );
     }
 
     #[test]
     fn render_release_install_script_preserves_symlinked_rc_files() {
         let script = render_release_install_script();
 
-        assert!(script.contains("if [[ -L \"$file_path\" ]]; then"));
-        assert!(script.contains(
-            "cat \"$(dirname -- \"$file_path\")/.${file_path##*/}.next\" > \"$file_path\""
-        ));
+        assert!(script.contains("local next_file"));
         assert!(
-            script.contains(
-                "mv \"$(dirname -- \"$file_path\")/.${file_path##*/}.next\" \"$file_path\""
-            )
+            script.contains("next_file=\"$(dirname -- \"$file_path\")/.${file_path##*/}.next\"")
         );
+        assert!(script.contains("if [[ -L \"$file_path\" ]]; then"));
+        assert!(script.contains("cat \"$next_file\" > \"$file_path\""));
+        assert!(script.contains("mv \"$next_file\" \"$file_path\""));
+        assert!(script.contains("rm -f \"$tmp_file\" \"$next_file\""));
     }
 
     #[test]
