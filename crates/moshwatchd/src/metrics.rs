@@ -19,7 +19,9 @@ use moshwatch_core::{
     ObserverInfo, SessionKind, SessionSummary,
 };
 use opentelemetry_proto::tonic::{
-    collector::metrics::v1::{ExportMetricsServiceRequest, ExportMetricsServiceResponse},
+    collector::metrics::v1::{
+        ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    },
     common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
     metrics::v1::{
         AggregationTemporality, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
@@ -1112,14 +1114,25 @@ async fn handle_otlp_response(response: reqwest::Response) -> Result<()> {
     }
     let response = ExportMetricsServiceResponse::decode(body.as_ref())
         .context("decode OTLP protobuf response")?;
-    if let Some(partial) = response.partial_success
-        && (partial.rejected_data_points > 0 || !partial.error_message.trim().is_empty())
-    {
-        anyhow::bail!(
-            "collector reported partial success: rejected_data_points={}, error_message={}",
-            partial.rejected_data_points,
-            partial.error_message
-        );
+    handle_otlp_partial_success(response.partial_success)?;
+    Ok(())
+}
+
+fn handle_otlp_partial_success(partial_success: Option<ExportMetricsPartialSuccess>) -> Result<()> {
+    if let Some(partial) = partial_success {
+        if partial.rejected_data_points > 0 {
+            anyhow::bail!(
+                "collector reported partial success: rejected_data_points={}, error_message={}",
+                partial.rejected_data_points,
+                partial.error_message
+            );
+        }
+        if !partial.error_message.trim().is_empty() {
+            tracing::warn!(
+                "collector reported warning-only partial success: {}",
+                truncate_for_log(&partial.error_message, 256)
+            );
+        }
     }
     Ok(())
 }
@@ -1436,10 +1449,10 @@ mod tests {
     use prost::Message;
 
     use super::{
-        MetricCollectionOptions, MetricsTextFormat, OtlpExporterStatsSnapshot, build_otlp_client,
-        collect_metric_samples, encode_otlp_metrics, extract_bearer_token,
-        metrics_request_is_authorized, otlp_headers, render_metrics, requested_metrics_format,
-        unix_nanos,
+        ExportMetricsPartialSuccess, MetricCollectionOptions, MetricsTextFormat,
+        OtlpExporterStatsSnapshot, build_otlp_client, collect_metric_samples, encode_otlp_metrics,
+        extract_bearer_token, handle_otlp_partial_success, metrics_request_is_authorized,
+        otlp_headers, render_metrics, requested_metrics_format, unix_nanos,
     };
     use crate::runtime_stats::RuntimeStatsSnapshot;
     use crate::{
@@ -1781,6 +1794,32 @@ mod tests {
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
             Some("application/x-protobuf")
+        );
+    }
+
+    #[test]
+    fn otlp_partial_success_warning_only_is_non_fatal() {
+        let partial_success = ExportMetricsPartialSuccess {
+            rejected_data_points: 0,
+            error_message: "collector note".to_string(),
+        };
+
+        handle_otlp_partial_success(Some(partial_success))
+            .expect("warning-only partial success should not fail");
+    }
+
+    #[test]
+    fn otlp_partial_success_with_rejections_is_fatal() {
+        let partial_success = ExportMetricsPartialSuccess {
+            rejected_data_points: 3,
+            error_message: "rejected".to_string(),
+        };
+
+        let err = handle_otlp_partial_success(Some(partial_success))
+            .expect_err("rejected data points should fail");
+        assert!(
+            err.to_string().contains("rejected_data_points"),
+            "error should mention rejected points: {err}"
         );
     }
 

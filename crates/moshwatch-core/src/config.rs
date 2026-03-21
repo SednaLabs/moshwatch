@@ -101,6 +101,8 @@ impl Default for PersistenceConfig {
 #[serde(default)]
 pub struct PrometheusMetricsConfig {
     /// Optional TCP listen address for Prometheus/OpenMetrics scraping.
+    /// Use an empty TOML string to disable the listener entirely.
+    #[serde(default, deserialize_with = "deserialize_optional_listen_addr")]
     pub listen_addr: Option<String>,
     /// Explicit opt-in for non-loopback metrics exposure.
     pub allow_non_loopback: bool,
@@ -116,6 +118,20 @@ impl Default for PrometheusMetricsConfig {
             detail_tier: MetricsDetailTier::PerSession,
         }
     }
+}
+
+fn deserialize_optional_listen_addr<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let listen_addr = Option::<String>::deserialize(deserializer)?;
+    Ok(listen_addr.and_then(|listen_addr| {
+        if listen_addr.trim().is_empty() {
+            None
+        } else {
+            Some(listen_addr)
+        }
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,7 +194,11 @@ impl<'de> Deserialize<'de> for MetricsConfig {
         let compat = MetricsConfigCompat::deserialize(deserializer)?;
         let mut prometheus = compat.prometheus.unwrap_or_default();
         if let Some(listen_addr) = compat.listen_addr {
-            prometheus.listen_addr = Some(listen_addr);
+            prometheus.listen_addr = if listen_addr.trim().is_empty() {
+                None
+            } else {
+                Some(listen_addr)
+            };
         }
         if let Some(allow_non_loopback) = compat.allow_non_loopback {
             prometheus.allow_non_loopback = allow_non_loopback;
@@ -1079,6 +1099,22 @@ detail_tier = "aggregate_only"
             parsed.metrics.prometheus.detail_tier,
             MetricsDetailTier::AggregateOnly
         );
+    }
+
+    #[test]
+    fn metrics_prometheus_listen_addr_can_be_disabled_in_toml() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics.prometheus]
+listen_addr = ""
+"#,
+        )
+        .expect("parse config with disabled metrics listener");
+
+        assert_eq!(parsed.metrics.prometheus.listen_addr, None);
+        parsed
+            .validate()
+            .expect("disabled metrics listener should validate");
     }
 
     #[test]
