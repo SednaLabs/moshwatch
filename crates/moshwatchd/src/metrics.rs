@@ -118,6 +118,7 @@ pub fn metrics_content_type(format: MetricsTextFormat) -> &'static str {
 }
 
 pub fn requested_metrics_format(request: &str) -> MetricsTextFormat {
+    let mut preference = AcceptPreference::default();
     for line in request.lines().skip(1) {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
@@ -129,25 +130,53 @@ pub fn requested_metrics_format(request: &str) -> MetricsTextFormat {
         if !name.eq_ignore_ascii_case("accept") {
             continue;
         }
-        if accept_header_allows_openmetrics(value) {
-            return MetricsTextFormat::OpenMetricsText;
+        let parsed = accept_header_preference(value);
+        preference.openmetrics_quality = preference
+            .openmetrics_quality
+            .max(parsed.openmetrics_quality);
+        preference.text_plain_quality =
+            preference.text_plain_quality.max(parsed.text_plain_quality);
+    }
+    if preference.prefers_openmetrics() {
+        MetricsTextFormat::OpenMetricsText
+    } else {
+        MetricsTextFormat::PrometheusText
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AcceptPreference {
+    openmetrics_quality: f32,
+    text_plain_quality: f32,
+}
+
+impl AcceptPreference {
+    fn prefers_openmetrics(self) -> bool {
+        self.openmetrics_quality > self.text_plain_quality && self.openmetrics_quality > 0.0
+    }
+}
+
+fn accept_header_preference(value: &str) -> AcceptPreference {
+    let mut preference = AcceptPreference::default();
+    for item in value.split(',') {
+        let Some((media_type, quality)) = accept_item_quality(item) else {
+            continue;
+        };
+        if media_type.eq_ignore_ascii_case("application/openmetrics-text") {
+            preference.openmetrics_quality = preference.openmetrics_quality.max(quality);
+        } else if media_type.eq_ignore_ascii_case("text/plain") {
+            preference.text_plain_quality = preference.text_plain_quality.max(quality);
         }
     }
-    MetricsTextFormat::PrometheusText
+    preference
 }
 
-fn accept_header_allows_openmetrics(value: &str) -> bool {
-    value.split(',').any(accept_item_allows_openmetrics)
-}
-
-fn accept_item_allows_openmetrics(item: &str) -> bool {
+fn accept_item_quality(item: &str) -> Option<(&str, f32)> {
     let mut parts = item.split(';');
-    let Some(media_type) = parts.next().map(str::trim) else {
-        return false;
+    let media_type = parts.next().map(str::trim)?;
+    if media_type.is_empty() {
+        return None;
     };
-    if !media_type.eq_ignore_ascii_case("application/openmetrics-text") {
-        return false;
-    }
 
     let mut quality = 1.0_f32;
     for parameter in parts {
@@ -158,16 +187,16 @@ fn accept_item_allows_openmetrics(item: &str) -> bool {
             continue;
         }
         let Ok(parsed) = raw_value.trim().trim_matches('"').parse::<f32>() else {
-            return false;
+            return None;
         };
         if !(0.0..=1.0).contains(&parsed) {
-            return false;
+            return None;
         }
         quality = parsed;
         break;
     }
 
-    quality > 0.0
+    Some((media_type, quality))
 }
 
 pub fn render_metrics(
@@ -840,7 +869,7 @@ fn render_metric_samples(
             output,
             "# TYPE {} {}",
             descriptor.name,
-            metric_type_text(descriptor)
+            metric_type_text(descriptor, format)
         );
         for sample in series {
             render_metric_sample(&mut output, descriptor, sample);
@@ -872,11 +901,14 @@ fn render_metric_sample(output: &mut String, descriptor: &MetricDescriptor, samp
     let _ = writeln!(output, "{}", sample.value);
 }
 
-fn metric_type_text(descriptor: &MetricDescriptor) -> &'static str {
+fn metric_type_text(descriptor: &MetricDescriptor, format: MetricsTextFormat) -> &'static str {
     match descriptor.kind {
         MetricType::Gauge => "gauge",
         MetricType::Counter => "counter",
-        MetricType::Info => "gauge",
+        MetricType::Info => match format {
+            MetricsTextFormat::PrometheusText => "gauge",
+            MetricsTextFormat::OpenMetricsText => "info",
+        },
     }
 }
 
@@ -1567,6 +1599,15 @@ mod tests {
     }
 
     #[test]
+    fn openmetrics_accept_q_values_choose_the_higher_preference() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; q=0.2, application/openmetrics-text; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            MetricsTextFormat::OpenMetricsText
+        );
+    }
+
+    #[test]
     fn openmetrics_accept_q_zero_falls_back_to_prometheus_text() {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; q=0, text/plain\r\n\r\n";
         assert_eq!(
@@ -1576,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn openmetrics_render_ends_with_eof_marker() {
+    fn openmetrics_render_uses_info_metric_type_for_info_series() {
         let metrics = render_metrics(
             &AppConfig::default(),
             &ObserverInfo {
@@ -1589,6 +1630,8 @@ mod tests {
             OtlpExporterStatsSnapshot::default(),
             MetricsTextFormat::OpenMetricsText,
         );
+        assert!(metrics.contains("# TYPE moshwatch_build_info info"));
+        assert!(metrics.contains("# TYPE moshwatch_session_info info"));
         assert!(metrics.ends_with("# EOF\n"));
     }
 
