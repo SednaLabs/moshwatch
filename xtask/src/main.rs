@@ -553,7 +553,10 @@ install -m 0755 "$RELEASE_ROOT/bin/moshwatch" "$USER_BIN_DIR/moshwatch"
 render_template() {{
     local source_file="$1"
     local destination_file="$2"
-    sed "s#@INSTALL_BIN_DIR@#${{INSTALL_BIN_DIR}}#g" "$source_file" > "$destination_file"
+    local rendered_file
+    rendered_file="$(mktemp "$(dirname -- "$destination_file")/.${{destination_file##*/}}.XXXXXX")"
+    sed "s#@INSTALL_BIN_DIR@#${{INSTALL_BIN_DIR}}#g" "$source_file" > "$rendered_file"
+    mv "$rendered_file" "$destination_file"
 }}
 
 render_template "$RELEASE_ROOT/templates/mosh-server-wrapper.sh" "$USER_BIN_DIR/mosh-server"
@@ -1655,6 +1658,23 @@ mod tests {
         assert!(script.contains("buffered[buffered_lines++] = $0"));
         assert!(script.contains("if (skipping) {"));
         assert!(script.contains("print buffered[idx]"));
+    }
+
+    #[test]
+    fn render_release_install_script_does_not_render_templates_through_symlinks() {
+        let script = render_release_install_script();
+
+        assert!(script.contains("local rendered_file"));
+        assert!(script.contains(
+            r#"rendered_file="$(mktemp "$(dirname -- "$destination_file")/.${destination_file##*/}.XXXXXX")""#
+        ));
+        assert!(script.contains(
+            r#"sed "s#@INSTALL_BIN_DIR@#${INSTALL_BIN_DIR}#g" "$source_file" > "$rendered_file""#
+        ));
+        assert!(script.contains(r#"mv "$rendered_file" "$destination_file""#));
+        assert!(!script.contains(
+            r#"sed "s#@INSTALL_BIN_DIR@#${INSTALL_BIN_DIR}#g" "$source_file" > "$destination_file""#
+        ));
     }
 
     #[test]
