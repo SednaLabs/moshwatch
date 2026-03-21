@@ -141,7 +141,7 @@ pub const METRIC_CATALOG: &[MetricDescriptor] = &[
         cardinality: MetricCardinality::Static,
         privacy: MetricPrivacy::OperatorSensitive,
         labels: MetricLabelSchema::Observer,
-        minimum_detail_tier: MetricsDetailTier::AggregateOnly,
+        minimum_detail_tier: MetricsDetailTier::PerSession,
     },
     MetricDescriptor {
         id: MetricId::Sessions,
@@ -606,7 +606,8 @@ pub fn metric_descriptor(id: MetricId) -> &'static MetricDescriptor {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{METRIC_CATALOG, MetricLabelSchema, MetricPrivacy};
+    use super::{METRIC_CATALOG, MetricId, MetricLabelSchema, MetricPrivacy, metric_descriptor};
+    use crate::MetricsDetailTier;
 
     #[test]
     fn metric_catalog_names_are_unique() {
@@ -632,5 +633,13 @@ mod tests {
                 assert_eq!(descriptor.privacy, MetricPrivacy::OperatorSensitive);
             }
         }
+    }
+
+    #[test]
+    fn observer_info_series_require_per_session_detail() {
+        assert_eq!(
+            metric_descriptor(MetricId::ObserverInfo).minimum_detail_tier,
+            MetricsDetailTier::PerSession
+        );
     }
 }
