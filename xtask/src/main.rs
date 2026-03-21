@@ -18,10 +18,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use flate2::{Compression, GzBuilder, write::GzEncoder};
+use flate2::{write::GzEncoder, Compression, GzBuilder};
 use moshwatch_core::{
-    AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy, MetricsDetailTier,
-    metric_catalog,
+    metric_catalog, AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy,
+    MetricsDetailTier,
 };
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
@@ -623,8 +623,12 @@ upsert_managed_block() {{
         fi
     fi
 
-    # Write through the managed path so symlinked rc files keep the link itself.
-    cat "$(dirname -- "$file_path")/.${{file_path##*/}}.next" > "$file_path"
+    if [[ -L "$file_path" ]]; then
+        # Write through the managed path so symlinked rc files keep the link itself.
+        cat "$(dirname -- "$file_path")/.${{file_path##*/}}.next" > "$file_path"
+    else
+        mv "$(dirname -- "$file_path")/.${{file_path##*/}}.next" "$file_path"
+    fi
     rm -f "$tmp_file"
 }}
 
@@ -1538,7 +1542,7 @@ mod tests {
     use std::{
         cell::Cell,
         fs,
-        os::unix::{fs::PermissionsExt, fs::symlink},
+        os::unix::{fs::symlink, fs::PermissionsExt},
         path::Path,
         thread,
         time::Duration,
@@ -1547,12 +1551,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MoshServerBuildInfo, PATH_BLOCK_END, PATH_BLOCK_START, Placement, install_binary,
-        install_text_file, local_build_source_date_epoch_from, release_artifact_paths,
-        render_release_install_script, render_template, sha256_hex, stage_release_tree,
-        strip_managed_block, tool_command_from_environment, upsert_managed_block,
-        validate_release_tree, vendored_build_environment_from, write_binary_archive,
-        write_mosh_server_build_info, write_sha256_sums,
+        install_binary, install_text_file, local_build_source_date_epoch_from,
+        release_artifact_paths, render_release_install_script, render_template, sha256_hex,
+        stage_release_tree, strip_managed_block, tool_command_from_environment,
+        upsert_managed_block, validate_release_tree, vendored_build_environment_from,
+        write_binary_archive, write_mosh_server_build_info, write_sha256_sums, MoshServerBuildInfo,
+        Placement, PATH_BLOCK_END, PATH_BLOCK_START,
     };
 
     #[test]
@@ -1590,12 +1594,10 @@ mod tests {
 
         upsert_managed_block(&path, &block, Placement::Prepend).expect("upsert symlinked rc");
 
-        assert!(
-            fs::symlink_metadata(&path)
-                .expect("stat symlink")
-                .file_type()
-                .is_symlink()
-        );
+        assert!(fs::symlink_metadata(&path)
+            .expect("stat symlink")
+            .file_type()
+            .is_symlink());
         assert_eq!(fs::read_to_string(&target).expect("read target"), expected);
         assert_eq!(fs::read_to_string(&path).expect("read symlink"), expected);
     }
@@ -1604,14 +1606,12 @@ mod tests {
     fn render_release_install_script_preserves_symlinked_rc_files() {
         let script = render_release_install_script();
 
+        assert!(script.contains("if [[ -L \"$file_path\" ]]; then"));
         assert!(script.contains(
             "cat \"$(dirname -- \"$file_path\")/.${file_path##*/}.next\" > \"$file_path\""
         ));
-        assert!(
-            !script.contains(
-                "mv \"$(dirname -- \"$file_path\")/.${file_path##*/}.next\" \"$file_path\""
-            )
-        );
+        assert!(script
+            .contains("mv \"$(dirname -- \"$file_path\")/.${file_path##*/}.next\" \"$file_path\""));
     }
 
     #[test]
