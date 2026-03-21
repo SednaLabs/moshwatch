@@ -133,11 +133,8 @@ pub fn requested_metrics_format(request: &str) -> MetricsTextFormat {
             continue;
         }
         let parsed = accept_header_preference(value);
-        preference.openmetrics_quality = preference
-            .openmetrics_quality
-            .max(parsed.openmetrics_quality);
-        preference.text_plain_quality =
-            preference.text_plain_quality.max(parsed.text_plain_quality);
+        preference.openmetrics = merge_accept_match(preference.openmetrics, parsed.openmetrics);
+        preference.text_plain = merge_accept_match(preference.text_plain, parsed.text_plain);
     }
     if preference.prefers_openmetrics() {
         MetricsTextFormat::OpenMetricsText
@@ -148,28 +145,66 @@ pub fn requested_metrics_format(request: &str) -> MetricsTextFormat {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct AcceptPreference {
-    openmetrics_quality: f32,
-    text_plain_quality: f32,
+    openmetrics: Option<AcceptMatch>,
+    text_plain: Option<AcceptMatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AcceptMatch {
+    quality: f32,
+    specificity: u8,
 }
 
 impl AcceptPreference {
     fn prefers_openmetrics(self) -> bool {
-        self.openmetrics_quality > self.text_plain_quality && self.openmetrics_quality > 0.0
+        match (self.openmetrics, self.text_plain) {
+            (Some(openmetrics), Some(text_plain)) => {
+                openmetrics.is_finally_preferred_over(text_plain)
+            }
+            (Some(openmetrics), None) => openmetrics.quality > 0.0,
+            _ => false,
+        }
+    }
+}
+
+impl AcceptMatch {
+    fn is_candidate_preferred_over(self, other: Self) -> bool {
+        self.specificity > other.specificity
+            || (self.specificity == other.specificity && self.quality > other.quality)
+    }
+
+    fn is_finally_preferred_over(self, other: Self) -> bool {
+        self.quality > other.quality
+            || (self.quality == other.quality && self.specificity > other.specificity)
+    }
+}
+
+fn merge_accept_match(
+    current: Option<AcceptMatch>,
+    candidate: Option<AcceptMatch>,
+) -> Option<AcceptMatch> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) if candidate.is_candidate_preferred_over(current) => {
+            Some(candidate)
+        }
+        (Some(current), _) => Some(current),
+        (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
     }
 }
 
 fn accept_header_preference(value: &str) -> AcceptPreference {
     let mut preference = AcceptPreference::default();
     for item in value.split(',') {
-        if let Some(quality) = accept_item_quality(
+        if let Some(candidate) = accept_item_quality(
             item,
             "application/openmetrics-text",
             OPENMETRICS_TEXT_VERSION,
         ) {
-            preference.openmetrics_quality = preference.openmetrics_quality.max(quality);
+            preference.openmetrics = merge_accept_match(preference.openmetrics, Some(candidate));
         }
-        if let Some(quality) = accept_item_quality(item, "text/plain", PROMETHEUS_TEXT_VERSION) {
-            preference.text_plain_quality = preference.text_plain_quality.max(quality);
+        if let Some(candidate) = accept_item_quality(item, "text/plain", PROMETHEUS_TEXT_VERSION) {
+            preference.text_plain = merge_accept_match(preference.text_plain, Some(candidate));
         }
     }
     preference
@@ -182,15 +217,13 @@ fn accept_item_quality(
     item: &str,
     expected_media_type: &str,
     expected_version: &str,
-) -> Option<f32> {
+) -> Option<AcceptMatch> {
     let mut parts = item.split(';');
     let media_type = parts.next().map(str::trim)?;
     if media_type.is_empty() {
         return None;
     }
-    if !media_type.eq_ignore_ascii_case(expected_media_type) {
-        return None;
-    }
+    let specificity = accept_media_type_matches(media_type, expected_media_type)?;
 
     let mut quality = 1.0_f32;
     let mut version = None;
@@ -221,7 +254,34 @@ fn accept_item_quality(
         return None;
     }
 
-    Some(quality)
+    Some(AcceptMatch {
+        quality,
+        specificity,
+    })
+}
+
+fn accept_media_type_matches(candidate: &str, expected: &str) -> Option<u8> {
+    let Some((candidate_type, candidate_subtype)) = candidate.split_once('/') else {
+        return None;
+    };
+    let Some((expected_type, expected_subtype)) = expected.split_once('/') else {
+        return None;
+    };
+
+    let candidate_type = candidate_type.trim();
+    let candidate_subtype = candidate_subtype.trim();
+
+    match (candidate_type, candidate_subtype) {
+        ("*", "*") => Some(0),
+        (type_token, "*") if type_token.eq_ignore_ascii_case(expected_type) => Some(1),
+        (type_token, subtype_token)
+            if type_token.eq_ignore_ascii_case(expected_type)
+                && subtype_token.eq_ignore_ascii_case(expected_subtype) =>
+        {
+            Some(2)
+        }
+        _ => None,
+    }
 }
 
 pub fn render_metrics(
@@ -1648,6 +1708,33 @@ mod tests {
         assert_eq!(
             requested_metrics_format(request),
             MetricsTextFormat::OpenMetricsText
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_application_wildcard_matches_openmetrics() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/*\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            MetricsTextFormat::OpenMetricsText
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_star_wildcard_still_respects_quality() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; q=0.2, */*; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            MetricsTextFormat::OpenMetricsText
+        );
+    }
+
+    #[test]
+    fn explicit_text_plain_beats_wildcard_at_equal_quality() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: */*; q=0.8, text/plain; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            MetricsTextFormat::PrometheusText
         );
     }
 
