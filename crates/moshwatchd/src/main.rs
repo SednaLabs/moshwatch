@@ -55,7 +55,7 @@ use crate::{
         read_process_metadata,
     },
     history::HistoryStore,
-    metrics::run_metrics_server,
+    metrics::{OtlpExporterStats, run_metrics_server, run_otlp_exporter},
     runtime_stats::RuntimeStats,
     state::{ServiceState, instrumented_session_id},
 };
@@ -117,14 +117,14 @@ async fn main() -> Result<()> {
     }
     let mut config = paths.load_config()?;
     if let Some(metrics_listen) = args.metrics_listen {
-        config.metrics.listen_addr = Some(metrics_listen);
+        config.metrics.prometheus.listen_addr = Some(metrics_listen);
     }
     if args.allow_public_metrics {
-        config.metrics.allow_non_loopback = true;
+        config.metrics.prometheus.allow_non_loopback = true;
     }
     enforce_metrics_listener_policy(
-        config.metrics.listen_addr.as_deref(),
-        config.metrics.allow_non_loopback,
+        config.metrics.prometheus.listen_addr.as_deref(),
+        config.metrics.prometheus.allow_non_loopback,
     )?;
 
     remove_socket_if_present(&paths.api_socket)?;
@@ -160,11 +160,14 @@ async fn main() -> Result<()> {
     });
     let metrics_auth_token = config
         .metrics
+        .prometheus
         .listen_addr
         .as_ref()
         .map(|_| paths.load_or_create_metrics_auth_token())
         .transpose()?
         .map(Arc::<str>::from);
+
+    let otlp_exporter_stats = OtlpExporterStats::default();
 
     let context = AppContext {
         observer: observer.clone(),
@@ -172,6 +175,7 @@ async fn main() -> Result<()> {
         snapshots: snapshots.clone(),
         history: history_store.clone(),
         runtime_stats: runtime_stats.clone(),
+        otlp_stats: otlp_exporter_stats.clone(),
         stream_heartbeat_ms: config.stream.heartbeat_ms,
         stream_slots: Arc::new(Semaphore::new(STREAM_CONNECTION_SLOTS)),
         history_query_slots: Arc::new(Semaphore::new(HISTORY_QUERY_SLOTS)),
@@ -198,39 +202,74 @@ async fn main() -> Result<()> {
             config.persistence.sample_interval_ms,
         )
     });
-    let mut metrics_task = config.metrics.listen_addr.clone().map(|listen_addr| {
-        let history_store = history_store.clone();
-        let metrics_auth_token = metrics_auth_token.clone().expect("metrics token");
-        let runtime_stats = runtime_stats.clone();
-        let observer = observer.clone();
-        tokio::spawn(async move {
-            if let Err(error) = run_metrics_server(
-                state.clone(),
-                history_store,
-                runtime_stats,
-                observer,
-                listen_addr.clone(),
-                metrics_auth_token,
-            )
-            .await
-            {
-                tracing::error!("metrics server stopped: {error:#}");
-            }
-        })
-    });
-    let mut metrics_token_task = config.metrics.listen_addr.clone().map(|_| {
+    let metrics_state = state.clone();
+    let mut metrics_task = config
+        .metrics
+        .prometheus
+        .listen_addr
+        .clone()
+        .map(|listen_addr| {
+            let state = metrics_state.clone();
+            let history_store = history_store.clone();
+            let metrics_auth_token = metrics_auth_token.clone().expect("metrics token");
+            let runtime_stats = runtime_stats.clone();
+            let observer = observer.clone();
+            let otlp_exporter_stats = otlp_exporter_stats.clone();
+            tokio::spawn(async move {
+                if let Err(error) = run_metrics_server(
+                    state,
+                    history_store,
+                    runtime_stats,
+                    observer,
+                    listen_addr,
+                    metrics_auth_token,
+                    otlp_exporter_stats,
+                )
+                .await
+                {
+                    tracing::error!("metrics server stopped: {error:#}");
+                }
+            })
+        });
+    let mut metrics_token_task = config.metrics.prometheus.listen_addr.clone().map(|_| {
         let paths = paths.clone();
         let metrics_auth_token = metrics_auth_token.clone().expect("metrics token");
         spawn_metrics_token_reconciler(paths, metrics_auth_token)
+    });
+
+    let otlp_state = state.clone();
+    let mut otlp_task = config.metrics.otlp.enabled.then(|| {
+        let state = otlp_state.clone();
+        let history_store = history_store.clone();
+        let runtime_stats = runtime_stats.clone();
+        let observer = observer.clone();
+        let config = config.clone();
+        let otlp_exporter_stats = otlp_exporter_stats.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_otlp_exporter(
+                state,
+                history_store,
+                runtime_stats,
+                observer,
+                config,
+                otlp_exporter_stats,
+            )
+            .await
+            {
+                tracing::error!("otlp exporter stopped: {error:#}");
+            }
+        })
     });
 
     tracing::info!(
         api_socket = %paths.api_socket.display(),
         telemetry_socket = %paths.telemetry_socket.display(),
         history_dir = %paths.history_dir.display(),
-        metrics_listen = ?config.metrics.listen_addr,
+        metrics_listen = ?config.metrics.prometheus.listen_addr,
+        otlp_enabled = config.metrics.otlp.enabled,
         metrics_token_path = config
             .metrics
+            .prometheus
             .listen_addr
             .as_ref()
             .map(|_| paths.metrics_token_path.display().to_string()),
@@ -245,6 +284,7 @@ async fn main() -> Result<()> {
         result = await_optional_task(history_task.as_mut(), "history") => result,
         result = await_optional_task(metrics_task.as_mut(), "metrics") => result,
         result = await_optional_task(metrics_token_task.as_mut(), "metrics_token") => result,
+        result = await_optional_task(otlp_task.as_mut(), "otlp") => result,
         result = &mut snapshot_task => unexpected_task_exit("snapshot", result),
     };
     tracing::info!("shutting down moshwatchd");
@@ -259,6 +299,9 @@ async fn main() -> Result<()> {
     }
     if let Some(metrics_token_task) = metrics_token_task {
         metrics_token_task.abort();
+    }
+    if let Some(otlp_task) = otlp_task {
+        otlp_task.abort();
     }
     snapshot_task.abort();
     remove_socket_if_present(&paths.api_socket)?;
@@ -781,7 +824,7 @@ fn enforce_metrics_listener_policy(
     if metrics_listener_is_not_loopback(listen_addr) {
         if !allow_non_loopback {
             anyhow::bail!(
-                "metrics listener {} is not loopback; set metrics.allow_non_loopback=true or pass --allow-public-metrics to opt in",
+                "metrics listener {} is not loopback; set metrics.prometheus.allow_non_loopback=true or pass --allow-public-metrics to opt in",
                 listen_addr.unwrap_or_default()
             );
         }

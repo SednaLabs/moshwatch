@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 /// Version number for the exported API and event-stream schema.
 ///
 /// Bump this only when a consumer-visible contract changes.
-pub const API_SCHEMA_VERSION: u32 = 3;
+pub const API_SCHEMA_VERSION: u32 = 4;
 
-/// Schema version implied by REST responses from daemons older than v3.
+/// Schema version implied by REST responses from daemons older than v4.
 pub const LEGACY_REST_SCHEMA_VERSION: u32 = 2;
 
 fn default_rest_schema_version() -> u32 {
@@ -171,6 +171,9 @@ pub struct SessionSummary {
     pub started_at_unix_ms: i64,
     /// Last time this session was observed by telemetry or discovery.
     pub last_observed_unix_ms: i64,
+    /// When telemetry counters were last reset during this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_reset_unix_ms: Option<i64>,
     /// Bound local address when known.
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
@@ -329,6 +332,71 @@ pub struct ApiSessionControlResponse {
     pub action: SessionControlAction,
 }
 
+/// Backward-compatible metrics shape for `GET /v1/config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiMetricsConfig {
+    /// TCP metrics listener address when enabled.
+    #[serde(default)]
+    pub listen_addr: Option<String>,
+    /// Whether non-loopback Prometheus binds are allowed.
+    pub allow_non_loopback: bool,
+    /// Prometheus detail tier for local scraping.
+    #[serde(default)]
+    pub detail_tier: crate::MetricsDetailTier,
+    /// OTLP metrics export configuration.
+    #[serde(default)]
+    pub otlp: crate::config::OtlpMetricsConfig,
+}
+
+/// Effective daemon configuration shape returned by `GET /v1/config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiAppConfig {
+    pub refresh_ms: u64,
+    pub discovery_interval_ms: u64,
+    pub cleanup_interval_ms: u64,
+    pub history_secs: u64,
+    pub max_tracked_sessions: usize,
+    pub max_session_detail_points: usize,
+    pub thresholds: crate::config::HealthThresholds,
+    pub stream: crate::config::EventStreamConfig,
+    pub persistence: crate::config::PersistenceConfig,
+    #[serde(default)]
+    pub metrics: ApiMetricsConfig,
+}
+
+impl Default for ApiMetricsConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: None,
+            allow_non_loopback: false,
+            detail_tier: crate::MetricsDetailTier::PerSession,
+            otlp: crate::config::OtlpMetricsConfig::default(),
+        }
+    }
+}
+
+impl From<&crate::config::AppConfig> for ApiAppConfig {
+    fn from(config: &crate::config::AppConfig) -> Self {
+        Self {
+            refresh_ms: config.refresh_ms,
+            discovery_interval_ms: config.discovery_interval_ms,
+            cleanup_interval_ms: config.cleanup_interval_ms,
+            history_secs: config.history_secs,
+            max_tracked_sessions: config.max_tracked_sessions,
+            max_session_detail_points: config.max_session_detail_points,
+            thresholds: config.thresholds.clone(),
+            stream: config.stream.clone(),
+            persistence: config.persistence.clone(),
+            metrics: ApiMetricsConfig {
+                listen_addr: config.metrics.prometheus.listen_addr.clone(),
+                allow_non_loopback: config.metrics.prometheus.allow_non_loopback,
+                detail_tier: config.metrics.prometheus.detail_tier,
+                otlp: config.metrics.otlp.clone(),
+            },
+        }
+    }
+}
+
 /// Response body for `GET /v1/config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfigResponse {
@@ -340,7 +408,7 @@ pub struct ApiConfigResponse {
     /// Response generation time in Unix milliseconds.
     pub generated_at_unix_ms: i64,
     /// Effective daemon configuration.
-    pub config: crate::config::AppConfig,
+    pub config: ApiAppConfig,
 }
 
 /// Persisted history sample for one session at one recording point.
@@ -363,6 +431,9 @@ pub struct HistorySample {
     pub health: HealthState,
     /// Process start time in Unix milliseconds.
     pub started_at_unix_ms: i64,
+    /// When telemetry counters were last reset during this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_reset_unix_ms: Option<i64>,
     /// Bound local address when known.
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
@@ -490,8 +561,9 @@ mod tests {
 
     use super::{
         ApiConfigResponse, ApiHistoryResponse, ApiSessionControlResponse, ApiSessionResponse,
-        ApiSessionsResponse, HealthState, LEGACY_REST_SCHEMA_VERSION, SessionControlAction,
-        SessionKind, SessionMetrics, SessionPeerInfo, SessionSummary, classify_health,
+        ApiSessionsResponse, HealthState, HistorySample, LEGACY_REST_SCHEMA_VERSION,
+        SessionControlAction, SessionKind, SessionMetrics, SessionPeerInfo, SessionSummary,
+        classify_health,
     };
     use crate::{
         config::{AppConfig, HealthThresholds},
@@ -514,6 +586,7 @@ mod tests {
             health: HealthState::Ok,
             started_at_unix_ms: 1_000,
             last_observed_unix_ms: 2_000,
+            counter_reset_unix_ms: None,
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),
@@ -583,7 +656,7 @@ mod tests {
                 schema_version: super::API_SCHEMA_VERSION,
                 observer: observer(),
                 generated_at_unix_ms: 2_000,
-                config: AppConfig::default(),
+                config: (&AppConfig::default()).into(),
             })
             .expect("encode config response"),
         ))
@@ -602,6 +675,50 @@ mod tests {
         ))
         .expect("decode history response without schema_version");
         assert_eq!(history.schema_version, LEGACY_REST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn history_sample_defaults_counter_reset_marker_when_missing() {
+        let payload = serde_json::json!({
+            "observer": observer(),
+            "recorded_at_unix_ms": 2_000,
+            "session_id": "instrumented:1000:42",
+            "display_session_id": "display-1",
+            "pid": 42,
+            "kind": "instrumented",
+            "health": "ok",
+            "started_at_unix_ms": 1_000,
+            "bind_addr": "127.0.0.1",
+            "udp_port": 60001,
+            "client_addr": "192.0.2.1:60001",
+            "current_client_addr": "192.0.2.1:60001",
+            "metrics": SessionMetrics::default(),
+        });
+        let sample: HistorySample =
+            serde_json::from_value(payload).expect("decode history sample without reset marker");
+        assert_eq!(sample.counter_reset_unix_ms, None);
+    }
+
+    #[test]
+    fn history_sample_serializes_counter_reset_marker_when_present() {
+        let sample = HistorySample {
+            observer: Some(observer()),
+            recorded_at_unix_ms: 2_000,
+            session_id: "instrumented:1000:42".to_string(),
+            display_session_id: Some("display-1".to_string()),
+            pid: 42,
+            kind: SessionKind::Instrumented,
+            health: HealthState::Ok,
+            started_at_unix_ms: 1_000,
+            counter_reset_unix_ms: Some(1_500),
+            bind_addr: Some("127.0.0.1".to_string()),
+            udp_port: Some(60001),
+            client_addr: Some("192.0.2.1:60001".to_string()),
+            current_client_addr: Some("192.0.2.1:60001".to_string()),
+            metrics: SessionMetrics::default(),
+        };
+        let encoded = serde_json::to_value(sample).expect("encode history sample");
+        assert_eq!(encoded["counter_reset_unix_ms"], serde_json::json!(1_500));
     }
 
     #[test]
@@ -676,5 +793,54 @@ mod tests {
             ),
             HealthState::Ok
         );
+    }
+
+    #[test]
+    fn api_metrics_config_defaults_when_detail_tier_missing() {
+        let payload = serde_json::json!({
+            "observer": {"node_name": "node-1", "system_id": "system-1"},
+            "generated_at_unix_ms": 1,
+            "config": {
+                "refresh_ms": 1000,
+                "discovery_interval_ms": 5000,
+                "cleanup_interval_ms": 10000,
+                "history_secs": 900,
+                "max_tracked_sessions": 2048,
+                "max_session_detail_points": 900,
+                "thresholds": crate::config::HealthThresholds::default(),
+                "stream": crate::config::EventStreamConfig::default(),
+                "persistence": crate::config::PersistenceConfig::default(),
+                "metrics": {
+                    "listen_addr": null,
+                    "allow_non_loopback": false,
+                    "otlp": crate::config::OtlpMetricsConfig::default()
+                }
+            }
+        });
+
+        let parsed: super::ApiConfigResponse =
+            serde_json::from_value(payload).expect("deserialize API config response");
+        assert_eq!(
+            parsed.config.metrics.detail_tier,
+            crate::MetricsDetailTier::PerSession
+        );
+        assert_eq!(parsed.config.metrics.listen_addr, None);
+    }
+
+    #[test]
+    fn api_metrics_config_serializes_null_listen_addr_for_disabled_listener() {
+        let mut config = crate::config::AppConfig::default();
+        config.metrics.prometheus.listen_addr = None;
+        let payload = super::ApiConfigResponse {
+            schema_version: super::API_SCHEMA_VERSION,
+            observer: crate::identity::ObserverInfo {
+                node_name: "node-1".to_string(),
+                system_id: "system-1".to_string(),
+            },
+            generated_at_unix_ms: 1,
+            config: (&config).into(),
+        };
+        let value = serde_json::to_value(payload).expect("serialize API config response");
+        assert!(value["config"]["metrics"]["listen_addr"].is_null());
     }
 }

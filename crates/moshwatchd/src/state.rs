@@ -45,6 +45,13 @@ pub struct ServiceState {
     dropped_sessions_total: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHealthCount {
+    pub kind: SessionKind,
+    pub health: HealthState,
+    pub sessions: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExportedSummaries {
     pub sessions: Vec<SessionSummary>,
@@ -52,6 +59,7 @@ pub struct ExportedSummaries {
     pub truncated_session_count: usize,
     pub instrumented_sessions: usize,
     pub legacy_sessions: usize,
+    pub health_counts: Vec<SessionHealthCount>,
     pub dropped_sessions_total: u64,
 }
 
@@ -134,6 +142,7 @@ impl ServiceState {
                     health: HealthState::Ok,
                     started_at_unix_ms: started_at,
                     last_observed_unix_ms: initial_observed_unix_ms,
+                    counter_reset_unix_ms: None,
                     bind_addr: bind_addr.clone(),
                     udp_port: event.udp_port,
                     client_addr: None,
@@ -155,6 +164,7 @@ impl ServiceState {
                 pid = entry.summary.pid,
                 "reset session history after telemetry counter regression"
             );
+            entry.summary.counter_reset_unix_ms = Some(event_unix_ms);
             entry.history.clear();
             entry.counters.clear();
         } else if entry
@@ -279,6 +289,7 @@ impl ServiceState {
                         health: HealthState::Legacy,
                         started_at_unix_ms: session.started_at_unix_ms,
                         last_observed_unix_ms: now_ms,
+                        counter_reset_unix_ms: None,
                         bind_addr: session.bind_addr.clone(),
                         udp_port: session.udp_port,
                         client_addr: None,
@@ -351,12 +362,60 @@ impl ServiceState {
         let mut sessions = Vec::with_capacity(limit.min(self.sessions.len()));
         let mut instrumented_sessions = 0usize;
         let mut legacy_sessions = 0usize;
+        let mut health_counts = vec![
+            SessionHealthCount {
+                kind: SessionKind::Instrumented,
+                health: HealthState::Ok,
+                sessions: 0,
+            },
+            SessionHealthCount {
+                kind: SessionKind::Instrumented,
+                health: HealthState::Degraded,
+                sessions: 0,
+            },
+            SessionHealthCount {
+                kind: SessionKind::Instrumented,
+                health: HealthState::Critical,
+                sessions: 0,
+            },
+            SessionHealthCount {
+                kind: SessionKind::Instrumented,
+                health: HealthState::Legacy,
+                sessions: 0,
+            },
+            SessionHealthCount {
+                kind: SessionKind::Legacy,
+                health: HealthState::Ok,
+                sessions: 0,
+            },
+            SessionHealthCount {
+                kind: SessionKind::Legacy,
+                health: HealthState::Degraded,
+                sessions: 0,
+            },
+            SessionHealthCount {
+                kind: SessionKind::Legacy,
+                health: HealthState::Critical,
+                sessions: 0,
+            },
+            SessionHealthCount {
+                kind: SessionKind::Legacy,
+                health: HealthState::Legacy,
+                sessions: 0,
+            },
+        ];
 
         for record in self.sessions.values() {
             let summary = self.materialize_summary(record, now_ms);
             match summary.kind {
                 SessionKind::Instrumented => instrumented_sessions += 1,
                 SessionKind::Legacy => legacy_sessions += 1,
+            }
+            if let Some(count) = health_counts
+                .iter_mut()
+                .find(|count| count.kind == summary.kind && count.health == summary.health)
+            {
+                count.sessions += 1;
             }
             if limit == 0 {
                 continue;
@@ -376,6 +435,7 @@ impl ServiceState {
             truncated_session_count,
             instrumented_sessions,
             legacy_sessions,
+            health_counts,
             dropped_sessions_total: self.dropped_sessions_total,
         }
     }
@@ -1036,6 +1096,7 @@ mod tests {
         assert_eq!(detail.history.len(), 1);
         assert_eq!(detail.summary.metrics.retransmit_pct_10s, None);
         assert!(!detail.summary.metrics.retransmit_window_10s_complete);
+        assert_eq!(detail.summary.counter_reset_unix_ms, Some(13_000));
     }
 
     #[test]

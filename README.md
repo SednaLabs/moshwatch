@@ -28,7 +28,7 @@ The repo builds and installs four operator-facing pieces:
 - `moshwatchd`
   A local daemon that ingests telemetry, discovers legacy sessions, keeps
   bounded in-memory state, persists bounded history, serves a local API,
-  and exports Prometheus metrics.
+  and exports Prometheus/OpenMetrics with optional OTLP metrics export.
 - `moshwatch`
   A terminal UI for live inspection and same-user session actions.
 - `mosh-server` wrapper
@@ -101,6 +101,7 @@ Mosh session on a host; `observer` identifies which host observed that session.
   without limit
 - TCP metrics scraping must be authenticated because loopback is not a
   multi-user security boundary
+- OTLP exporter egress and secrets must remain explicit operator choices
 
 Important non-goals:
 
@@ -412,7 +413,15 @@ History is bounded in two ways:
 If the disk budget is exhausted, the daemon drops new history samples rather
 than growing the state directory without limit.
 
-## Prometheus Metrics
+## Metrics And Exporters
+
+`moshwatchd` exposes metrics in three operator-facing ways:
+
+- Prometheus text over the bearer-protected TCP listener
+- Prometheus or OpenMetrics text over the owner-only Unix-socket `/metrics` route
+- optional OTLP metrics export to a collector
+
+### Prometheus And OpenMetrics
 
 By default, `moshwatchd` listens on:
 
@@ -420,18 +429,26 @@ By default, `moshwatchd` listens on:
 127.0.0.1:9947
 ```
 
-and serves Prometheus exposition text at:
+and serves metrics at:
 
 ```text
 http://127.0.0.1:9947/metrics
 ```
 
-The same metrics payload is also available without HTTP auth on the Unix-socket
-API endpoint:
+The same payload is also available on the Unix-socket API endpoint:
 
 ```text
 GET /metrics
 ```
+
+Send:
+
+```text
+Accept: application/openmetrics-text; version=1.0.0
+```
+
+if you want OpenMetrics text. Otherwise the daemon falls back to Prometheus
+text.
 
 ### TCP Metrics Authentication
 
@@ -452,35 +469,60 @@ with mode `0600`.
 Example manual scrape:
 
 ```bash
-curl -H "Authorization: Bearer $(cat "${XDG_STATE_HOME:-$HOME/.local/state}/moshwatch/metrics.token")" \
-  http://127.0.0.1:9947/metrics
+curl -H "Authorization: Bearer $(cat "${XDG_STATE_HOME:-$HOME/.local/state}/moshwatch/metrics.token")"   http://127.0.0.1:9947/metrics
 ```
 
-Example Prometheus config:
+Start from the shipped example Prometheus config:
 
-```yaml
-scrape_configs:
-  - job_name: moshwatch
-    metrics_path: /metrics
-    static_configs:
-      - targets: ['127.0.0.1:9947']
-    bearer_token_file: /home/<user>/.local/state/moshwatch/metrics.token
-```
+- `examples/observability/prometheus/prometheus.yml`
+- `examples/observability/prometheus/rules/moshwatch.rules.yml`
+- `examples/observability/prometheus/tests/moshwatch.rules.test.yml`
+
+The shipped Prometheus config is a template. Replace the placeholder
+`bearer_token_file` path with the real token location for the user that runs
+Prometheus.
 
 If you intentionally bind metrics off loopback, `moshwatchd` will reject that
-configuration unless you also set `metrics.allow_non_loopback = true` or start
-the daemon with `--allow-public-metrics`.
+configuration unless you also set
+`metrics.prometheus.allow_non_loopback = true` or start the daemon with
+`--allow-public-metrics`.
 
-### Prometheus-Specific Signals
+### OTLP Metrics Export
 
-Useful `moshwatch`-specific series include:
+OTLP export is optional and disabled by default. When enabled, the daemon sends
+OTLP/HTTP metrics to the configured collector endpoint. The default shape is:
 
-Session info series keep `client_addr` as the last-known peer for compatibility
-and add `current_client_addr` for the live attached peer when present.
+- endpoint: `http://127.0.0.1:4318/v1/metrics`
+- default detail tier: `aggregate_only`
+- additional headers and resource attributes configured under `[metrics.otlp]`
+- `metrics.otlp.headers` must use valid HTTP header syntax; `accept` and `content-type` are reserved by the exporter and rejected if configured explicitly
+- built-in observer identity is included only for `per_session` OTLP; `aggregate_only` omits it
+- `metrics.otlp.resource_attributes` are merged into the OTLP resource emitted by the daemon, but built-in OTLP keys are reserved and rejected during configuration validation
+
+Start from the shipped collector example:
+
+- `examples/observability/otel-collector/otelcol.yaml`
+
+Recommended practice:
+
+- keep OTLP pointed at a collector on loopback unless you have a clear network
+  design
+- prefer HTTPS when OTLP leaves the host
+- treat OTLP headers as secrets
+- keep Prometheus as the canonical local scrape contract and use OTLP as an
+  additional export path rather than a replacement
+
+### Useful Signals
+
+Useful `moshwatch` metrics include:
 
 - `moshwatch_observer_info`
   Stable machine attribution for the daemon emitting the metric stream.
 
+- `moshwatch_sessions`
+  Total tracked sessions by kind.
+- `moshwatch_sessions_by_health`
+  Total tracked sessions by kind and derived health state.
 - `moshwatch_session_retransmit_window_complete{window="10s"|"60s"}`
   Distinguishes a warming window from a missing retransmit ratio.
 - `moshwatch_runtime_dropped_sessions_total`
@@ -503,10 +545,20 @@ and add `current_client_addr` for the live attached peer when present.
   Last observed runtime for each periodic loop.
 - `moshwatch_runtime_loop_overruns_total{loop=...}`
   Number of times a periodic loop took longer than its configured interval.
+- `moshwatch_otlp_export_enabled{detail_tier=...}`
+  Whether OTLP export is enabled and which detail tier it uses.
+- `moshwatch_otlp_exports_total{result="success"|"failure"}`
+  OTLP exporter attempts grouped by result.
 
 Use `moshwatch_observer_info` for machine attribution in Prometheus joins or
 multi-host dashboards rather than repeating host labels across every
 session-level series.
+
+See also:
+
+- `docs/observability/operator-guide.md`
+- `docs/observability/metric-catalog.md`
+- `examples/observability/README.md`
 
 ## Configuration
 
@@ -517,49 +569,41 @@ On first start, `moshwatchd` writes a default config file unless started with
 ${XDG_CONFIG_HOME:-$HOME/.config}/moshwatch/moshwatch.toml
 ```
 
-Current config schema:
+The canonical generated default lives at:
+
+- `examples/observability/config/moshwatch.toml`
+
+Preferred metrics layout:
 
 ```toml
-refresh_ms = 1000
-discovery_interval_ms = 5000
-cleanup_interval_ms = 10000
-history_secs = 900
-max_tracked_sessions = 2048
-max_session_detail_points = 900
-
-[thresholds]
-warn_rtt_ms = 400
-critical_rtt_ms = 1000
-warn_retransmit_pct = 2.0
-critical_retransmit_pct = 10.0
-warn_silence_ms = 5000
-critical_silence_ms = 15000
-
-[stream]
-heartbeat_ms = 15000
-
-[persistence]
-enabled = true
-sample_interval_ms = 5000
-retention_days = 14
-max_query_samples = 4096
-max_disk_bytes = 536870912
-
-[metrics]
+[metrics.prometheus]
 listen_addr = "127.0.0.1:9947"
 allow_non_loopback = false
+detail_tier = "per_session"
+
+[metrics.otlp]
+enabled = false
+endpoint = "http://127.0.0.1:4318/v1/metrics"
+export_interval_ms = 15000
+timeout_ms = 5000
+detail_tier = "aggregate_only"
 ```
 
 Notes:
 
+- legacy flat `[metrics]` Prometheus settings remain parse-compatible, but the
+  nested exporter layout is preferred
 - `warn_loss_pct` and `critical_loss_pct` are accepted as compatibility aliases
-  for `warn_retransmit_pct` and `critical_retransmit_pct`.
-- `history_secs` controls only in-memory sparkline history.
-- `persistence.max_disk_bytes` is the hard on-disk history budget.
+  for `warn_retransmit_pct` and `critical_retransmit_pct`
+- `history_secs` controls only in-memory sparkline history
+- `persistence.max_disk_bytes` is the hard on-disk history budget
 - `RTX10` and `RTX60` stay in a warming state until the full observation window
-  exists.
+  exists
 - `warn_silence_ms` and `critical_silence_ms` apply to `last_heard_age_ms`, not
-  to remote-state idleness.
+  to remote-state idleness
+- `metrics.otlp.resource_attributes` are merged into the OTLP resource emitted
+  by the daemon, but built-in OTLP keys are reserved and rejected during
+  configuration validation
 
 ## Daemon Flags
 
@@ -634,6 +678,7 @@ Set:
 
 ```toml
 [metrics]
+[metrics.prometheus]
 allow_non_loopback = true
 ```
 
@@ -693,6 +738,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 bash -n scripts/mosh-server-wrapper.sh
 cargo run --locked -p xtask -- build
+cargo run --locked -p xtask -- check-observability-docs
+cargo run --locked -p xtask -- validate-observability-assets
 git diff --check
 ```
 
@@ -706,8 +753,9 @@ curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/moshwatch/api.sock" h
 ```
 
 The same validation set is encoded in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) for CI use when the
-repository is hosted on a compatible platform.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) through a reusable
+validation workflow, and the tagged release workflow reuses that same
+validation before publishing a draft GitHub Release.
 
 ## Repository Layout
 
@@ -736,8 +784,47 @@ If you publish artifacts that include `mosh-server-real`, publish complete
 corresponding source for the exact binaries and preserve both the repository
 license texts and the upstream Mosh notices shipped in `vendor/mosh/`.
 
-Maintainers publish releases manually; there is no automated release pipeline
-from this working tree.
+Tagged `vX.Y.Z` releases are automated through GitHub Actions. Release tags
+must be signed annotated tags that point at the commit being packaged. The
+release workflow builds a draft GitHub Release with:
+
+- `moshwatch-vX.Y.Z-linux-x86_64.tar.gz`
+  Self-contained installable bundle with the built binaries, `install.sh`, the
+  wrapper and service templates, and the top-level license/documentation files.
+- `moshwatch-vX.Y.Z-source.tar.gz`
+  Source archive for the exact tagged commit.
+- `SHA256SUMS`
+  Checksums for the published tarballs.
+- `moshwatch-vX.Y.Z-moshwatchd.cdx.json`
+  CycloneDX dependency SBOM for the Rust daemon binary, generated from the
+  Cargo dependency graph with `cargo-cyclonedx`.
+- `moshwatch-vX.Y.Z-moshwatch-ui.cdx.json`
+  CycloneDX dependency SBOM for the Rust UI binary, generated from the Cargo
+  dependency graph with `cargo-cyclonedx`.
+- `moshwatch-vX.Y.Z-mosh-server-real.cdx.json`
+  CycloneDX SBOM for the packaged vendored `mosh-server-real` binary, generated
+  with Syft. This describes the shipped component and its package contents, not
+  a full source dependency graph.
+- `moshwatch-vX.Y.Z-mosh-server-real-build-info.json`
+  Build-info record for the packaged `mosh-server-real` binary, including the
+  source revision, toolchain metadata, pinned locale/timezone/archive-date
+  behavior, and the `SOURCE_DATE_EPOCH` value used to keep the build path
+  reproducible.
+
+The release workflow also publishes a provenance attestation for the packaged
+`mosh-server-real` binary itself, separate from the tarball-level attestation,
+and records the pinned default tool environment unless the operator overrides
+it.
+
+Maintainers still review and publish the draft release after the workflow
+finishes. GitHub's generated release notes are used, with the checked-in
+release-note configuration and tag range defining what appears in the draft.
+
+To dry-run the same packaging path locally before tagging, run:
+
+```bash
+cargo run --locked -p xtask -- package-release --tag vX.Y.Z
+```
 
 See:
 

@@ -41,7 +41,10 @@ use tokio::{
 use crate::{
     discovery::{is_supported_mosh_server_metadata, read_process_metadata},
     history::HistoryStore,
-    metrics::render_metrics,
+    metrics::{
+        MetricsTextFormat, OtlpExporterStats, metrics_content_type, render_metrics,
+        requested_metrics_format,
+    },
     runtime_stats::RuntimeStats,
     state::{ExportedSummaries, ServiceState},
 };
@@ -126,6 +129,7 @@ pub struct AppContext {
     pub snapshots: SnapshotHub,
     pub history: Option<Arc<HistoryStore>>,
     pub runtime_stats: RuntimeStats,
+    pub otlp_stats: OtlpExporterStats,
     pub stream_heartbeat_ms: u64,
     pub stream_slots: Arc<Semaphore>,
     pub history_query_slots: Arc<Semaphore>,
@@ -204,17 +208,19 @@ async fn handle_connection(mut stream: UnixStream, context: AppContext) -> Resul
         return stream_events(stream, context).await;
     }
 
-    let (status, body, content_type) = match build_response(method, path, query, context).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!("api request processing failed: {error:#}");
-            (
-                500,
-                b"{\"error\":\"internal server error\"}".to_vec(),
-                "application/json",
-            )
-        }
-    };
+    let metrics_format = requested_metrics_format(&request);
+    let (status, body, content_type) =
+        match build_response(method, path, query, metrics_format, context).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("api request processing failed: {error:#}");
+                (
+                    500,
+                    b"{\"error\":\"internal server error\"}".to_vec(),
+                    "application/json",
+                )
+            }
+        };
     write_response_with_timeout(&mut stream, status, &body, content_type).await
 }
 
@@ -274,6 +280,7 @@ async fn build_response(
     method: &str,
     path: &str,
     query: Option<&str>,
+    metrics_format: Option<MetricsTextFormat>,
     context: AppContext,
 ) -> Result<(u16, Vec<u8>, &'static str)> {
     let now_ms = moshwatch_core::time::unix_time_ms();
@@ -302,7 +309,7 @@ async fn build_response(
                 schema_version: API_SCHEMA_VERSION,
                 observer: context.observer.clone(),
                 generated_at_unix_ms: now_ms,
-                config: guard.config().clone(),
+                config: guard.config().into(),
             };
             (
                 200,
@@ -311,24 +318,38 @@ async fn build_response(
             )
         }
         ("GET", "/metrics") => {
-            let guard = context.state.read().await;
-            let export =
-                guard.export_summaries(now_ms, crate::metrics::MAX_METRICS_RENDERED_SESSIONS);
+            let Some(metrics_format) = metrics_format else {
+                return Ok((
+                    406,
+                    b"{\"error\":\"not acceptable\"}".to_vec(),
+                    "application/json",
+                ));
+            };
+            let (config, export) = {
+                let guard = context.state.read().await;
+                (
+                    guard.config().clone(),
+                    guard.export_summaries(now_ms, crate::metrics::MAX_METRICS_RENDERED_SESSIONS),
+                )
+            };
             // The owner-only Unix socket may expose `/metrics` without bearer
             // auth because access is already constrained by filesystem
             // permissions. The separate TCP metrics listener always enforces a
             // bearer token even on loopback; both routes intentionally share
-            // the same renderer.
+            // the same renderer and content negotiation behavior.
             (
                 200,
                 render_metrics(
+                    &config,
                     &context.observer,
                     &export,
                     context.history.as_ref().map(|store| store.stats_snapshot()),
                     context.runtime_stats.snapshot(),
+                    context.otlp_stats.snapshot().await,
+                    metrics_format,
                 )
                 .into_bytes(),
-                "text/plain; version=0.0.4",
+                metrics_content_type(metrics_format),
             )
         }
         ("GET", _) if path.starts_with("/v1/sessions/") => {
@@ -629,6 +650,7 @@ where
         404 => "Not Found",
         409 => "Conflict",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         408 => "Request Timeout",
         501 => "Not Implemented",
         503 => "Service Unavailable",
@@ -665,7 +687,10 @@ where
 mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
 
-    use moshwatch_core::{AppConfig, ObserverInfo, TelemetryEvent, TelemetryEventKind};
+    use moshwatch_core::{
+        API_SCHEMA_VERSION, ApiAppConfig, ApiConfigResponse, AppConfig, EventStreamEvent,
+        EventStreamFrame, ObserverInfo, TelemetryEvent, TelemetryEventKind,
+    };
     use tempfile::tempdir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -681,6 +706,7 @@ mod tests {
     };
     use crate::{
         history::HistoryStore,
+        metrics::OtlpExporterStats,
         runtime_stats::RuntimeStats,
         state::{ServiceState, instrumented_session_id},
     };
@@ -721,6 +747,7 @@ mod tests {
             snapshots,
             history,
             runtime_stats: RuntimeStats::default(),
+            otlp_stats: OtlpExporterStats::default(),
             stream_heartbeat_ms: 100,
             stream_slots,
             history_query_slots: Arc::new(Semaphore::new(HISTORY_QUERY_SLOTS)),
@@ -746,9 +773,25 @@ mod tests {
     }
 
     async fn request_method(socket_path: &Path, method: &str, target: &str) -> String {
+        request_method_with_headers(socket_path, method, target, &[]).await
+    }
+
+    async fn request_method_with_headers(
+        socket_path: &Path,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
         let mut stream = UnixStream::connect(socket_path).await.expect("connect");
-        let request =
-            format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut request =
+            format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
         stream
             .write_all(request.as_bytes())
             .await
@@ -767,6 +810,20 @@ mod tests {
             .split_once("\r\n\r\n")
             .expect("response should contain headers");
         serde_json::from_str(body).expect("json body")
+    }
+
+    fn strip_generated_at_unix_ms(value: &mut serde_json::Value) {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("generated_at_unix_ms");
+        }
+    }
+
+    fn assert_json_contract_eq(actual: serde_json::Value, expected: serde_json::Value) {
+        let mut actual = actual;
+        let mut expected = expected;
+        strip_generated_at_unix_ms(&mut actual);
+        strip_generated_at_unix_ms(&mut expected);
+        assert_eq!(actual, expected);
     }
 
     fn sample_event(unix_ms: i64) -> TelemetryEvent {
@@ -831,7 +888,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
-        assert_eq!(body["schema_version"], 3);
+        assert_eq!(body["schema_version"], API_SCHEMA_VERSION);
         assert_eq!(body["observer"]["node_name"], "node-1");
         assert_eq!(body["observer"]["system_id"], "system-1");
         assert_eq!(body["total_sessions"], 1);
@@ -842,6 +899,62 @@ mod tests {
             "192.0.2.1:60001"
         );
         assert_eq!(body["sessions"][0]["client_addr"], "192.0.2.1:60001");
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_preserves_flat_metrics_shape() {
+        let tempdir = tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("api.sock");
+        let mut config = AppConfig::default();
+        config.metrics.prometheus.listen_addr = Some("127.0.0.1:2233".to_string());
+        config.metrics.prometheus.allow_non_loopback = true;
+        config.metrics.prometheus.detail_tier = moshwatch_core::MetricsDetailTier::AggregateOnly;
+        config.metrics.otlp.enabled = true;
+        config.metrics.otlp.endpoint = "http://127.0.0.1:4318/v1/metrics".to_string();
+        let expected = serde_json::to_value(ApiConfigResponse {
+            schema_version: API_SCHEMA_VERSION,
+            observer: observer(),
+            generated_at_unix_ms: 0,
+            config: ApiAppConfig::from(&config),
+        })
+        .expect("serialize expected config response");
+        let state = Arc::new(RwLock::new(ServiceState::new(config)));
+        let snapshots = SnapshotHub::new(observer());
+
+        let task = spawn_api(state, snapshots, None, &socket_path).await;
+        wait_for_socket(&socket_path).await;
+
+        let response = request(&socket_path, "/v1/config").await;
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_json_contract_eq(json_body(&response), expected);
+    }
+
+    #[tokio::test]
+    async fn config_endpoint_serializes_disabled_metrics_listener_as_null() {
+        let tempdir = tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("api.sock");
+        let mut config = AppConfig::default();
+        config.metrics.prometheus.listen_addr = None;
+        let expected = serde_json::to_value(ApiConfigResponse {
+            schema_version: API_SCHEMA_VERSION,
+            observer: observer(),
+            generated_at_unix_ms: 0,
+            config: ApiAppConfig::from(&config),
+        })
+        .expect("serialize expected config response");
+        let state = Arc::new(RwLock::new(ServiceState::new(config)));
+        let snapshots = SnapshotHub::new(observer());
+
+        let task = spawn_api(state, snapshots, None, &socket_path).await;
+        wait_for_socket(&socket_path).await;
+
+        let response = request(&socket_path, "/v1/config").await;
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_json_contract_eq(json_body(&response), expected);
     }
 
     #[tokio::test]
@@ -877,7 +990,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
-        assert_eq!(body["schema_version"], 3);
+        assert_eq!(body["schema_version"], API_SCHEMA_VERSION);
         assert_eq!(
             body["session"]["peer"]["current_client_addr"],
             serde_json::Value::Null
@@ -921,6 +1034,30 @@ mod tests {
         );
         assert!(response.contains("moshwatch_session_srtt_ms"));
         assert!(response.contains("display_session_id=\"display-1\""));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_not_acceptable_for_unsupported_accept() {
+        let tempdir = tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("api.sock");
+        let state = Arc::new(RwLock::new(ServiceState::new(AppConfig::default())));
+        let snapshots = SnapshotHub::new(observer());
+
+        let task = spawn_api(state, snapshots, None, &socket_path).await;
+        wait_for_socket(&socket_path).await;
+
+        let response = request_method_with_headers(
+            &socket_path,
+            "GET",
+            "/metrics",
+            &[("Accept", "application/json")],
+        )
+        .await;
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 406 Not Acceptable"));
+        let body = json_body(&response);
+        assert_eq!(body["error"], "not acceptable");
     }
 
     #[tokio::test]
@@ -969,7 +1106,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
-        assert_eq!(body["schema_version"], 3);
+        assert_eq!(body["schema_version"], API_SCHEMA_VERSION);
         assert_eq!(body["observer"]["node_name"], "node-1");
         assert_eq!(body["observer"]["system_id"], "system-1");
         assert_eq!(body["session_id"], session_id);
@@ -1116,13 +1253,23 @@ mod tests {
             .write()
             .await
             .apply_telemetry(session_id.clone(), sample_event(2_000));
-        snapshots.publish_snapshot(
-            state
-                .read()
-                .await
-                .export_summaries(2_000, MAX_EXPORTED_SESSIONS),
-            2_000,
-        );
+        let exported = state
+            .read()
+            .await
+            .export_summaries(2_000, MAX_EXPORTED_SESSIONS);
+        let expected = serde_json::to_value(EventStreamFrame {
+            schema_version: API_SCHEMA_VERSION,
+            observer: observer(),
+            event: EventStreamEvent::Snapshot,
+            sequence: Some(1),
+            generated_at_unix_ms: 2_000,
+            total_sessions: Some(1),
+            truncated_session_count: Some(0),
+            dropped_sessions_total: Some(0),
+            sessions: Some(exported.sessions.clone()),
+        })
+        .expect("serialize expected snapshot frame");
+        snapshots.publish_snapshot(exported, 2_000);
 
         let task = spawn_api(state, snapshots, None, &socket_path).await;
         wait_for_socket(&socket_path).await;
@@ -1163,14 +1310,6 @@ mod tests {
             .expect("stream response should contain headers");
         let first_line = body.lines().next().expect("snapshot line");
         let frame: serde_json::Value = serde_json::from_str(first_line).expect("snapshot frame");
-        assert_eq!(frame["schema_version"], 3);
-        assert_eq!(frame["event"], "snapshot");
-        assert_eq!(frame["observer"]["node_name"], "node-1");
-        assert_eq!(frame["observer"]["system_id"], "system-1");
-        assert_eq!(frame["sessions"][0]["session_id"], session_id);
-        assert_eq!(
-            frame["sessions"][0]["peer"]["current_client_addr"],
-            "192.0.2.1:60001"
-        );
+        assert_eq!(frame, expected);
     }
 }

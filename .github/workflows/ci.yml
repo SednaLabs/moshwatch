@@ -3,15 +3,22 @@ name: ci
 on:
   push:
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.changes.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
@@ -26,7 +33,11 @@ jobs:
             while IFS= read -r path; do
               [[ -z "$path" ]] && continue
               case "$path" in
-                *.md|docs/*|LICENSE|NOTICE)
+                docs/observability/metric-catalog.md)
+                  docs_only=false
+                  break
+                  ;;
+                *.md|docs/*|LICENSE|NOTICE|LICENSES.md)
                   ;;
                 *)
                   docs_only=false
@@ -37,60 +48,19 @@ jobs:
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
-      - name: Docs-only shortcut
-        if: github.event_name == 'pull_request' && steps.changes.outputs.docs_only == 'true'
-        run: echo "Docs-only pull request; skipping heavy validation."
+  validate:
+    needs: changes
+    uses: ./.github/workflows/validate.yml
+    with:
+      docs_only: ${{ needs.changes.outputs.docs_only == 'true' }}
 
-      - name: Install system dependencies
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            autoconf \
-            automake \
-            g++ \
-            libncurses-dev \
-            libprotobuf-dev \
-            libtool \
-            libutempter-dev \
-            make \
-            pkg-config \
-            protobuf-compiler \
-            shellcheck
-
-      - name: Install Rust
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        shell: bash
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          rustup component add clippy rustfmt
-
-      - name: Cache Rust build artifacts
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        uses: Swatinem/rust-cache@v2
-
-      - name: Format check
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Test
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        run: cargo test --workspace --locked
-
-      - name: Shell wrapper syntax
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        run: bash -n scripts/mosh-server-wrapper.sh
-
-      - name: Shell wrapper lint
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        run: shellcheck scripts/mosh-server-wrapper.sh
-
-      - name: Build instrumented artifacts
-        if: github.event_name != 'pull_request' || steps.changes.outputs.docs_only != 'true'
-        run: cargo run --locked -p xtask -- build
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/dependency-review-action@da24556b548a50705dd671f47852072ea4c105d9 # v4.7.1
+        with:
+          fail-on-severity: high

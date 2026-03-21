@@ -99,6 +99,16 @@ cargo run --locked -p xtask -- build
 git diff --check
 ```
 
+GitHub Actions runs the same validation through the reusable
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) wrapper, and tagged
+releases reuse that validation before the draft release is created.
+
+To rehearse the release packaging locally before cutting a tag, run:
+
+```bash
+cargo run --locked -p xtask -- package-release --tag vX.Y.Z
+```
+
 For install, service, wrapper, metrics, API, or runtime-path changes, also run:
 
 ```bash
@@ -139,7 +149,29 @@ Releases that include `mosh-server-real` must be treated as GPLv3+ distributions
 for compliance purposes and must include corresponding source for the exact
 released binaries (including local instrumentation changes and build inputs).
 
-Maintainers handle release tags and published artifacts.
+Maintainers cut signed annotated `vX.Y.Z` tags that point at the release
+commit, GitHub Actions creates a draft release, and maintainers publish the
+draft after review.
+
+Keep the generated release-note inputs in sync with the release workflow so the
+draft notes stay scoped to the intended tag range and release categories.
+
+If the release workflow publishes SBOM assets, verify both tracks before
+publishing the draft:
+
+- the Rust `moshwatchd` and `moshwatch-ui` CycloneDX dependency SBOMs match
+  the Cargo dependency graph
+- the `mosh-server-real` CycloneDX SBOM matches the packaged vendored binary
+  and release tarball contents; it is not a full source dependency graph
+
+If the release workflow publishes the `mosh-server-real` build-info JSON, verify
+it matches the packaged binary's source revision, toolchain metadata, pinned
+locale/timezone/archive-date behavior, pinned default tool environment unless
+overridden, and the `SOURCE_DATE_EPOCH`-based reproducibility inputs used
+during packaging.
+
+The workflow also emits a separate provenance attestation for the packaged
+`mosh-server-real` binary itself, in addition to the tarball attestation.
 
 Before proposing release-facing changes, check:
 

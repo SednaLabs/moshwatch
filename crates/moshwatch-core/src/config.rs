@@ -9,6 +9,7 @@
 //! - config and token rewrites must not rely on predictable temporary paths
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -16,8 +17,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+use http::{
+    Uri,
+    header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+use crate::MetricsDetailTier;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -95,19 +102,157 @@ impl Default for PersistenceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct MetricsConfig {
-    /// Optional TCP listen address for Prometheus-format metrics.
+pub struct PrometheusMetricsConfig {
+    /// Optional TCP listen address for Prometheus/OpenMetrics scraping.
+    /// Use an empty TOML string to disable the listener entirely.
+    #[serde(default, deserialize_with = "deserialize_optional_listen_addr")]
     pub listen_addr: Option<String>,
     /// Explicit opt-in for non-loopback metrics exposure.
     pub allow_non_loopback: bool,
+    /// Controls whether per-session series are emitted or the export stays aggregate-only.
+    pub detail_tier: MetricsDetailTier,
 }
 
-impl Default for MetricsConfig {
+impl Default for PrometheusMetricsConfig {
     fn default() -> Self {
         Self {
             listen_addr: Some("127.0.0.1:9947".to_string()),
             allow_non_loopback: false,
+            detail_tier: MetricsDetailTier::PerSession,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct PrometheusMetricsConfigPartial {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_listen_addr_optional"
+    )]
+    listen_addr: Option<Option<String>>,
+    #[serde(default)]
+    allow_non_loopback: Option<bool>,
+    detail_tier: Option<MetricsDetailTier>,
+}
+
+fn deserialize_optional_listen_addr<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let listen_addr = Option::<String>::deserialize(deserializer)?;
+    Ok(listen_addr.and_then(|listen_addr| {
+        if listen_addr.trim().is_empty() {
+            None
+        } else {
+            Some(listen_addr)
+        }
+    }))
+}
+
+fn deserialize_optional_listen_addr_optional<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let listen_addr = Option::<String>::deserialize(deserializer)?;
+    Ok(listen_addr.map(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OtlpMetricsConfig {
+    /// Whether OTLP metrics export is enabled.
+    pub enabled: bool,
+    /// OTLP/HTTP metrics endpoint.
+    pub endpoint: String,
+    /// OTLP export interval in milliseconds.
+    pub export_interval_ms: u64,
+    /// OTLP export request timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Controls whether OTLP emits only aggregate metrics or per-session detail.
+    pub detail_tier: MetricsDetailTier,
+    /// Additional HTTP headers to attach to OTLP export requests.
+    pub headers: BTreeMap<String, String>,
+    /// Additional OTLP resource attributes for this daemon instance.
+    pub resource_attributes: BTreeMap<String, String>,
+}
+
+impl Default for OtlpMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "http://127.0.0.1:4318/v1/metrics".to_string(),
+            export_interval_ms: 15_000,
+            timeout_ms: 5_000,
+            detail_tier: MetricsDetailTier::AggregateOnly,
+            headers: BTreeMap::new(),
+            resource_attributes: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Prometheus/OpenMetrics scraping configuration.
+    pub prometheus: PrometheusMetricsConfig,
+    /// OTLP metrics export configuration.
+    pub otlp: OtlpMetricsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct MetricsConfigCompat {
+    prometheus: Option<PrometheusMetricsConfigPartial>,
+    otlp: Option<OtlpMetricsConfig>,
+    listen_addr: Option<String>,
+    allow_non_loopback: Option<bool>,
+    detail_tier: Option<MetricsDetailTier>,
+}
+
+impl<'de> Deserialize<'de> for MetricsConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let compat = MetricsConfigCompat::deserialize(deserializer)?;
+        let mut prometheus = PrometheusMetricsConfig::default();
+        if let Some(listen_addr) = compat.listen_addr {
+            prometheus.listen_addr = if listen_addr.trim().is_empty() {
+                None
+            } else {
+                Some(listen_addr)
+            };
+        }
+        if let Some(allow_non_loopback) = compat.allow_non_loopback {
+            prometheus.allow_non_loopback = allow_non_loopback;
+        }
+        if let Some(detail_tier) = compat.detail_tier {
+            prometheus.detail_tier = detail_tier;
+        }
+        if let Some(prometheus_override) = compat.prometheus {
+            if let Some(listen_addr_override) = prometheus_override.listen_addr {
+                prometheus.listen_addr = listen_addr_override;
+            }
+            if let Some(allow_non_loopback) = prometheus_override.allow_non_loopback {
+                prometheus.allow_non_loopback = allow_non_loopback;
+            }
+            if let Some(detail_tier) = prometheus_override.detail_tier {
+                prometheus.detail_tier = detail_tier;
+            }
+        }
+        Ok(Self {
+            prometheus,
+            otlp: compat.otlp.unwrap_or_default(),
+        })
     }
 }
 
@@ -267,10 +412,36 @@ impl AppConfig {
         if self.thresholds.warn_silence_ms > self.thresholds.critical_silence_ms {
             anyhow::bail!("warn_silence_ms must be less than or equal to critical_silence_ms");
         }
-        if let Some(listen_addr) = &self.metrics.listen_addr
+        if let Some(listen_addr) = &self.metrics.prometheus.listen_addr
             && listen_addr.trim().is_empty()
         {
-            anyhow::bail!("metrics.listen_addr cannot be empty when provided");
+            anyhow::bail!("metrics.prometheus.listen_addr cannot be empty when provided");
+        }
+        if self.metrics.otlp.enabled {
+            let endpoint = self.metrics.otlp.endpoint.trim();
+            if endpoint.is_empty() {
+                anyhow::bail!("metrics.otlp.endpoint cannot be empty when OTLP export is enabled");
+            }
+            validate_otlp_endpoint(endpoint)?;
+            if self.metrics.otlp.export_interval_ms == 0 {
+                anyhow::bail!("metrics.otlp.export_interval_ms must be greater than zero");
+            }
+            if self.metrics.otlp.timeout_ms == 0 {
+                anyhow::bail!("metrics.otlp.timeout_ms must be greater than zero");
+            }
+        }
+        for (name, value) in &self.metrics.otlp.headers {
+            validate_otlp_header(name, value)?;
+        }
+        for name in self.metrics.otlp.resource_attributes.keys() {
+            if name.trim().is_empty() {
+                anyhow::bail!("metrics.otlp.resource_attributes cannot contain an empty key");
+            }
+            if is_reserved_otlp_resource_attribute_key(name) {
+                anyhow::bail!(
+                    "metrics.otlp.resource_attributes cannot override reserved OTLP key {name}"
+                );
+            }
         }
         if self.cleanup_interval_ms < self.discovery_interval_ms {
             anyhow::bail!(
@@ -279,6 +450,61 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn validate_otlp_header(name: &str, value: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("metrics.otlp.headers cannot contain an empty header name");
+    }
+    let header_name = HeaderName::try_from(name).with_context(|| {
+        format!("metrics.otlp.headers contains invalid HTTP header name {name:?}")
+    })?;
+    if header_name == ACCEPT || header_name == CONTENT_TYPE {
+        anyhow::bail!("metrics.otlp.headers cannot override reserved OTLP header {name:?}");
+    }
+    HeaderValue::from_str(value).with_context(|| {
+        format!("metrics.otlp.headers contains invalid HTTP header value for {name:?}")
+    })?;
+    Ok(())
+}
+
+fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
+    if !endpoint.contains("://") {
+        anyhow::bail!(
+            "metrics.otlp.endpoint must include http:// or https:// scheme: {endpoint:?}"
+        );
+    }
+    let parsed = endpoint
+        .parse::<Uri>()
+        .with_context(|| format!("metrics.otlp.endpoint must be a valid HTTP URL: {endpoint:?}"))?;
+    let Some(scheme) = parsed.scheme_str() else {
+        anyhow::bail!(
+            "metrics.otlp.endpoint must include http:// or https:// scheme: {endpoint:?}"
+        );
+    };
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!("metrics.otlp.endpoint must use http or https scheme: {endpoint:?}");
+    }
+    if parsed.authority().is_none() {
+        anyhow::bail!(
+            "metrics.otlp.endpoint must include a host (and optional port): {endpoint:?}"
+        );
+    }
+    Ok(())
+}
+
+const OTLP_RESOURCE_ATTRIBUTE_RESERVED_KEYS: &[&str] = &[
+    "service.name",
+    "service.version",
+    "service.instance.id",
+    "moshwatch.observer.node_name",
+    "moshwatch.observer.system_id",
+];
+
+pub fn is_reserved_otlp_resource_attribute_key(key: &str) -> bool {
+    OTLP_RESOURCE_ATTRIBUTE_RESERVED_KEYS
+        .iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved))
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +1048,7 @@ mod tests {
     use super::{
         AppConfig, PersistenceConfig, RuntimePaths, remove_socket_if_present, set_socket_owner_only,
     };
+    use crate::MetricsDetailTier;
 
     #[test]
     fn partial_config_uses_defaults() {
@@ -846,7 +1073,276 @@ mod tests {
             parsed.max_session_detail_points,
             AppConfig::default().max_session_detail_points
         );
-        assert!(!parsed.metrics.allow_non_loopback);
+        assert!(!parsed.metrics.prometheus.allow_non_loopback);
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:9947")
+        );
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::PerSession
+        );
+        assert!(!parsed.metrics.otlp.enabled);
+        assert_eq!(
+            parsed.metrics.otlp.detail_tier,
+            MetricsDetailTier::AggregateOnly
+        );
+    }
+
+    #[test]
+    fn nested_metrics_config_overrides_defaults() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics.prometheus]
+listen_addr = "127.0.0.1:1234"
+allow_non_loopback = true
+detail_tier = "aggregate_only"
+
+[metrics.otlp]
+enabled = true
+endpoint = "http://127.0.0.1:4318/v1/metrics"
+export_interval_ms = 30000
+timeout_ms = 10000
+detail_tier = "per_session"
+
+[metrics.otlp.headers]
+authorization = "Bearer test"
+
+[metrics.otlp.resource_attributes]
+deployment_environment = "lab"
+"#,
+        )
+        .expect("parse nested metrics config");
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:1234")
+        );
+        assert!(parsed.metrics.prometheus.allow_non_loopback);
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::AggregateOnly
+        );
+        assert!(parsed.metrics.otlp.enabled);
+        assert_eq!(parsed.metrics.otlp.export_interval_ms, 30_000);
+        assert_eq!(parsed.metrics.otlp.timeout_ms, 10_000);
+        assert_eq!(
+            parsed.metrics.otlp.detail_tier,
+            MetricsDetailTier::PerSession
+        );
+        assert_eq!(
+            parsed
+                .metrics
+                .otlp
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer test")
+        );
+        assert_eq!(
+            parsed
+                .metrics
+                .otlp
+                .resource_attributes
+                .get("deployment_environment")
+                .map(String::as_str),
+            Some("lab")
+        );
+    }
+
+    #[test]
+    fn partial_metrics_prometheus_table_keeps_default_listener() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics.prometheus]
+detail_tier = "aggregate_only"
+            "#,
+        )
+        .expect("parse partial metrics table");
+
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:9947")
+        );
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::AggregateOnly
+        );
+    }
+
+    #[test]
+    fn partial_metrics_prometheus_table_can_disable_listener() {
+        let parsed: AppConfig = toml::from_str("[metrics.prometheus]\nlisten_addr = \"\"\n")
+            .expect("parse table disabling listener");
+        assert!(parsed.metrics.prometheus.listen_addr.is_none());
+    }
+
+    #[test]
+    fn legacy_metrics_config_still_parses() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics]
+listen_addr = "127.0.0.1:2233"
+allow_non_loopback = true
+detail_tier = "aggregate_only"
+"#,
+        )
+        .expect("parse legacy metrics config");
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:2233")
+        );
+        assert!(parsed.metrics.prometheus.allow_non_loopback);
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::AggregateOnly
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_nested_metrics_prefers_nested_conflicts() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics]
+listen_addr = "127.0.0.1:2233"
+allow_non_loopback = false
+detail_tier = "per_session"
+
+[metrics.prometheus]
+listen_addr = "127.0.0.1:9948"
+allow_non_loopback = true
+detail_tier = "aggregate_only"
+"#,
+        )
+        .expect("parse mixed legacy+nested metrics config");
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:9948")
+        );
+        assert!(parsed.metrics.prometheus.allow_non_loopback);
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::AggregateOnly
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_nested_metrics_keeps_legacy_for_non_conflicting_fields() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics]
+listen_addr = "127.0.0.1:2233"
+allow_non_loopback = true
+detail_tier = "aggregate_only"
+
+[metrics.prometheus]
+detail_tier = "per_session"
+"#,
+        )
+        .expect("parse mixed metrics config with partial nested overrides");
+        assert_eq!(
+            parsed.metrics.prometheus.listen_addr.as_deref(),
+            Some("127.0.0.1:2233")
+        );
+        assert!(parsed.metrics.prometheus.allow_non_loopback);
+        assert_eq!(
+            parsed.metrics.prometheus.detail_tier,
+            MetricsDetailTier::PerSession
+        );
+    }
+
+    #[test]
+    fn metrics_prometheus_listen_addr_can_be_disabled_in_toml() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics.prometheus]
+listen_addr = ""
+"#,
+        )
+        .expect("parse config with disabled metrics listener");
+
+        assert_eq!(parsed.metrics.prometheus.listen_addr, None);
+        parsed
+            .validate()
+            .expect("disabled metrics listener should validate");
+    }
+
+    #[test]
+    fn otlp_headers_reject_invalid_http_syntax() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics.otlp]
+enabled = true
+endpoint = "http://127.0.0.1:4318/v1/metrics"
+
+[metrics.otlp.headers]
+"X Foo" = "bar"
+"#,
+        )
+        .expect("parse config with invalid OTLP header syntax");
+
+        let error = parsed
+            .validate()
+            .expect_err("reject invalid OTLP header syntax");
+        assert!(error.to_string().contains("invalid HTTP header name"));
+    }
+
+    #[test]
+    fn otlp_headers_reject_reserved_protobuf_headers() {
+        let parsed: AppConfig = toml::from_str(
+            r#"
+[metrics.otlp]
+enabled = true
+endpoint = "http://127.0.0.1:4318/v1/metrics"
+
+[metrics.otlp.headers]
+accept = "text/plain"
+"#,
+        )
+        .expect("parse config with reserved OTLP header");
+
+        let error = parsed
+            .validate()
+            .expect_err("reject reserved OTLP header override");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot override reserved OTLP header")
+        );
+    }
+
+    #[test]
+    fn otlp_endpoint_requires_http_or_https_scheme() {
+        let missing_scheme: AppConfig = toml::from_str(
+            r#"
+[metrics.otlp]
+enabled = true
+endpoint = "127.0.0.1:4318/v1/metrics"
+"#,
+        )
+        .expect("parse config with missing OTLP endpoint scheme");
+        let err = missing_scheme
+            .validate()
+            .expect_err("missing OTLP endpoint scheme should be rejected");
+        assert!(
+            err.to_string().contains("must include http:// or https://"),
+            "unexpected missing-scheme error: {err}"
+        );
+
+        let unsupported_scheme: AppConfig = toml::from_str(
+            r#"
+[metrics.otlp]
+enabled = true
+endpoint = "udp://127.0.0.1:4318/v1/metrics"
+"#,
+        )
+        .expect("parse config with unsupported OTLP endpoint scheme");
+        let err = unsupported_scheme
+            .validate()
+            .expect_err("unsupported OTLP endpoint scheme should be rejected");
+        assert!(
+            err.to_string().contains("must use http or https"),
+            "unexpected unsupported-scheme error: {err}"
+        );
     }
 
     #[test]
@@ -935,6 +1431,37 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_validation_rejects_reserved_otlp_resource_attributes() {
+        for reserved_key in [
+            "service.name",
+            "service.version",
+            "service.instance.id",
+            "moshwatch.observer.node_name",
+            "moshwatch.observer.system_id",
+        ] {
+            let config: AppConfig = toml::from_str(&format!(
+                r#"
+[metrics.otlp]
+enabled = true
+endpoint = "http://127.0.0.1:4318/v1/metrics"
+
+[metrics.otlp.resource_attributes]
+"{reserved_key}" = "value"
+"#
+            ))
+            .expect("parse config with reserved OTLP resource key");
+
+            let err = config
+                .validate()
+                .expect_err("reserved OTLP resource key should be rejected");
+            assert!(
+                err.to_string().contains(reserved_key),
+                "error should mention reserved key {reserved_key}: {err}"
+            );
+        }
     }
 
     #[test]

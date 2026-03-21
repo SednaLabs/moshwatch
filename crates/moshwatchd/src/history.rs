@@ -503,6 +503,7 @@ fn encode_history_payload(
             kind: summary.kind.clone(),
             health: summary.health.clone(),
             started_at_unix_ms: summary.started_at_unix_ms,
+            counter_reset_unix_ms: summary.counter_reset_unix_ms,
             bind_addr: summary.bind_addr.clone(),
             udp_port: summary.udp_port,
             client_addr: summary.peer.last_client_addr.clone(),
@@ -703,6 +704,7 @@ mod tests {
             },
             cmdline: "mosh-server-real".to_string(),
             metrics: SessionMetrics::default(),
+            counter_reset_unix_ms: None,
         }
     }
 
@@ -911,6 +913,30 @@ mod tests {
     }
 
     #[test]
+    fn record_preserves_counter_reset_marker() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let store = HistoryStore::new(
+            observer(),
+            tempdir.path().join("history"),
+            7,
+            128,
+            1024 * 1024,
+        );
+        let mut summary = summary("session-1", 86_400_000);
+        summary.counter_reset_unix_ms = Some(86_399_500);
+
+        store
+            .record_summaries(86_400_000, &[summary])
+            .expect("record sample");
+
+        let samples = store
+            .query_session("session-1", 0, 16)
+            .expect("query samples");
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].counter_reset_unix_ms, Some(86_399_500));
+    }
+
+    #[test]
     fn drops_samples_when_payload_exceeds_disk_budget() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let store = HistoryStore::new(observer(), tempdir.path().join("history"), 7, 128, 1);
@@ -944,6 +970,7 @@ mod tests {
             kind: SessionKind::Instrumented,
             health: HealthState::Ok,
             started_at_unix_ms: 86_399_000,
+            counter_reset_unix_ms: None,
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),
@@ -976,6 +1003,7 @@ mod tests {
             kind: SessionKind::Instrumented,
             health: HealthState::Ok,
             started_at_unix_ms: 86_399_000,
+            counter_reset_unix_ms: None,
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),

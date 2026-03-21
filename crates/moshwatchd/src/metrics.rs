@@ -1,21 +1,44 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Prometheus rendering and optional TCP metrics listener.
+//! Prometheus/OpenMetrics rendering and OTLP metrics export.
 //!
-//! The same renderer is shared by the owner-only Unix-socket `/metrics` route
-//! and the optional TCP listener. The trust model differs: Unix-socket access
-//! is filesystem-gated, while the TCP listener always requires a bearer token,
-//! even on loopback.
+//! The same collector powers the owner-only Unix-socket `/metrics` route, the
+//! optional TCP scrape listener, and the optional OTLP exporter. The transport
+//! trust model differs, but the metric contract should not.
 
-use std::{fmt::Write as _, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
-use moshwatch_core::{HealthState, ObserverInfo, SessionSummary};
+use moshwatch_core::{
+    AppConfig, HealthState, MetricDescriptor, MetricId, MetricType, MetricsDetailLevel,
+    ObserverInfo, SessionKind, SessionSummary,
+};
+use opentelemetry_proto::tonic::{
+    collector::metrics::v1::{
+        ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    },
+    common::v1::{AnyValue, InstrumentationScope, KeyValue, any_value},
+    metrics::v1::{
+        AggregationTemporality, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+        metric, number_data_point,
+    },
+    resource::v1::Resource,
+};
+use prost::Message;
+use reqwest::{
+    Client,
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{RwLock, Semaphore},
-    time::timeout,
+    time::{MissedTickBehavior, interval, timeout},
 };
 
 use crate::{
@@ -28,378 +51,267 @@ pub type SharedState = Arc<RwLock<ServiceState>>;
 const METRICS_CONNECTION_SLOTS: usize = 64;
 const METRICS_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_METRICS_RENDERED_SESSIONS: usize = 256;
+const OTLP_INSTRUMENTATION_SCOPE: &str = "moshwatchd.metrics";
+const MAX_OTLP_RESPONSE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetricsTextFormat {
+    PrometheusText,
+    OpenMetricsText,
+}
+
+#[derive(Debug, Clone)]
+struct MetricSample {
+    labels: Vec<(&'static str, String)>,
+    value: f64,
+    start_time_unix_nano: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetricCollectionOptions {
+    detail_tier: MetricsDetailLevel,
+    include_observer_info: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OtlpExporterStatsSnapshot {
+    pub success_total: u64,
+    pub failure_total: u64,
+    pub last_duration_ms: Option<u64>,
+    pub last_success_unix_ms: Option<i64>,
+    pub last_failure_unix_ms: Option<i64>,
+    pub last_payload_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OtlpExporterStats {
+    inner: Arc<RwLock<OtlpExporterStatsSnapshot>>,
+}
+
+impl OtlpExporterStats {
+    pub async fn snapshot(&self) -> OtlpExporterStatsSnapshot {
+        self.inner.read().await.clone()
+    }
+
+    async fn record_success(&self, duration_ms: u64, finished_at_unix_ms: i64, payload_bytes: u64) {
+        let mut guard = self.inner.write().await;
+        guard.success_total += 1;
+        guard.last_duration_ms = Some(duration_ms);
+        guard.last_success_unix_ms = Some(finished_at_unix_ms);
+        guard.last_payload_bytes = Some(payload_bytes);
+    }
+
+    async fn record_failure(&self, duration_ms: u64, finished_at_unix_ms: i64, payload_bytes: u64) {
+        let mut guard = self.inner.write().await;
+        guard.failure_total += 1;
+        guard.last_duration_ms = Some(duration_ms);
+        guard.last_failure_unix_ms = Some(finished_at_unix_ms);
+        guard.last_payload_bytes = Some(payload_bytes);
+    }
+}
+
+pub fn metrics_content_type(format: MetricsTextFormat) -> &'static str {
+    match format {
+        MetricsTextFormat::PrometheusText => "text/plain; version=0.0.4; charset=utf-8",
+        MetricsTextFormat::OpenMetricsText => {
+            "application/openmetrics-text; version=1.0.0; charset=utf-8"
+        }
+    }
+}
+
+pub fn requested_metrics_format(request: &str) -> Option<MetricsTextFormat> {
+    let mut preference = AcceptPreference::default();
+    let mut saw_accept_header = false;
+    for line in request.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("accept") {
+            continue;
+        }
+        saw_accept_header = true;
+        let parsed = accept_header_preference(value);
+        preference.openmetrics = merge_accept_match(preference.openmetrics, parsed.openmetrics);
+        preference.text_plain = merge_accept_match(preference.text_plain, parsed.text_plain);
+    }
+    if preference.prefers_openmetrics() {
+        return Some(MetricsTextFormat::OpenMetricsText);
+    }
+    if preference
+        .text_plain
+        .is_some_and(|text_plain| text_plain.quality > 0.0)
+    {
+        return Some(MetricsTextFormat::PrometheusText);
+    }
+    if !saw_accept_header {
+        return Some(MetricsTextFormat::PrometheusText);
+    }
+    None
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AcceptPreference {
+    openmetrics: Option<AcceptMatch>,
+    text_plain: Option<AcceptMatch>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AcceptMatch {
+    quality: f32,
+    specificity: u8,
+}
+
+impl AcceptPreference {
+    fn prefers_openmetrics(self) -> bool {
+        match (self.openmetrics, self.text_plain) {
+            (Some(openmetrics), Some(text_plain)) => {
+                openmetrics.is_finally_preferred_over(text_plain)
+            }
+            (Some(openmetrics), None) => openmetrics.quality > 0.0,
+            _ => false,
+        }
+    }
+}
+
+impl AcceptMatch {
+    fn is_candidate_preferred_over(self, other: Self) -> bool {
+        self.specificity > other.specificity
+            || (self.specificity == other.specificity && self.quality > other.quality)
+    }
+
+    fn is_finally_preferred_over(self, other: Self) -> bool {
+        self.quality > other.quality
+            || (self.quality == other.quality && self.specificity > other.specificity)
+    }
+}
+
+fn merge_accept_match(
+    current: Option<AcceptMatch>,
+    candidate: Option<AcceptMatch>,
+) -> Option<AcceptMatch> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) if candidate.is_candidate_preferred_over(current) => {
+            Some(candidate)
+        }
+        (Some(current), _) => Some(current),
+        (None, Some(candidate)) => Some(candidate),
+        (None, None) => None,
+    }
+}
+
+fn accept_header_preference(value: &str) -> AcceptPreference {
+    let mut preference = AcceptPreference::default();
+    for item in value.split(',') {
+        if let Some(candidate) = accept_item_quality(
+            item,
+            "application/openmetrics-text",
+            OPENMETRICS_TEXT_VERSION,
+        ) {
+            preference.openmetrics = merge_accept_match(preference.openmetrics, Some(candidate));
+        }
+        if let Some(candidate) = accept_item_quality(item, "text/plain", PROMETHEUS_TEXT_VERSION) {
+            preference.text_plain = merge_accept_match(preference.text_plain, Some(candidate));
+        }
+    }
+    preference
+}
+
+const PROMETHEUS_TEXT_VERSION: &str = "0.0.4";
+const OPENMETRICS_TEXT_VERSION: &str = "1.0.0";
+
+fn accept_item_quality(
+    item: &str,
+    expected_media_type: &str,
+    expected_version: &str,
+) -> Option<AcceptMatch> {
+    let mut parts = item.split(';');
+    let media_type = parts.next().map(str::trim)?;
+    if media_type.is_empty() {
+        return None;
+    }
+    let specificity = accept_media_type_matches(media_type, expected_media_type)?;
+
+    let mut quality = 1.0_f32;
+    let mut version = None;
+    for parameter in parts {
+        let Some((name, raw_value)) = parameter.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = raw_value.trim().trim_matches('"');
+        if name.eq_ignore_ascii_case("q") {
+            let Ok(parsed) = value.parse::<f32>() else {
+                return None;
+            };
+            if !(0.0..=1.0).contains(&parsed) {
+                return None;
+            }
+            quality = parsed;
+            continue;
+        }
+        if name.eq_ignore_ascii_case("version") {
+            version = Some(value);
+        }
+    }
+
+    if let Some(version) = version
+        && version != expected_version
+    {
+        return None;
+    }
+
+    Some(AcceptMatch {
+        quality,
+        specificity,
+    })
+}
+
+fn accept_media_type_matches(candidate: &str, expected: &str) -> Option<u8> {
+    let (candidate_type, candidate_subtype) = candidate.split_once('/')?;
+    let (expected_type, expected_subtype) = expected.split_once('/')?;
+
+    let candidate_type = candidate_type.trim();
+    let candidate_subtype = candidate_subtype.trim();
+
+    match (candidate_type, candidate_subtype) {
+        ("*", "*") => Some(0),
+        (type_token, "*") if type_token.eq_ignore_ascii_case(expected_type) => Some(1),
+        (type_token, subtype_token)
+            if type_token.eq_ignore_ascii_case(expected_type)
+                && subtype_token.eq_ignore_ascii_case(expected_subtype) =>
+        {
+            Some(2)
+        }
+        _ => None,
+    }
+}
 
 pub fn render_metrics(
+    config: &AppConfig,
     observer: &ObserverInfo,
     export: &ExportedSummaries,
     history: Option<HistoryStatsSnapshot>,
     runtime: RuntimeStatsSnapshot,
+    otlp_stats: OtlpExporterStatsSnapshot,
+    format: MetricsTextFormat,
 ) -> String {
-    let mut output = String::new();
-    output.push_str("# HELP moshwatch_build_info Build information for moshwatchd.\n");
-    output.push_str("# TYPE moshwatch_build_info gauge\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_build_info{{version=\"{}\"}} 1",
-        escape_label(env!("CARGO_PKG_VERSION"))
+    let samples = collect_metric_samples(
+        config,
+        observer,
+        export,
+        history,
+        runtime,
+        &otlp_stats,
+        MetricCollectionOptions {
+            detail_tier: config.metrics.prometheus.detail_tier,
+            include_observer_info: config.metrics.prometheus.detail_tier.includes_sessions(),
+        },
     );
-    output.push_str("# HELP moshwatch_observer_info Host identity for this moshwatchd instance.\n");
-    output.push_str("# TYPE moshwatch_observer_info gauge\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_observer_info{{node_name=\"{}\",system_id=\"{}\"}} 1",
-        escape_label(&observer.node_name),
-        escape_label(&observer.system_id),
-    );
-
-    output.push_str("# HELP moshwatch_sessions Number of sessions by kind.\n");
-    output.push_str("# TYPE moshwatch_sessions gauge\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_sessions{{kind=\"instrumented\"}} {}",
-        export.instrumented_sessions
-    );
-    let _ = writeln!(
-        output,
-        "moshwatch_sessions{{kind=\"legacy\"}} {}",
-        export.legacy_sessions
-    );
-    output.push_str(
-        "# HELP moshwatch_metrics_rendered_sessions Number of session series rendered into the Prometheus export.\n",
-    );
-    output.push_str("# TYPE moshwatch_metrics_rendered_sessions gauge\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_metrics_rendered_sessions {}",
-        export.sessions.len()
-    );
-    output.push_str(
-        "# HELP moshwatch_metrics_truncated_sessions Number of sessions omitted from the Prometheus export due to render caps.\n",
-    );
-    output.push_str("# TYPE moshwatch_metrics_truncated_sessions gauge\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_metrics_truncated_sessions {}",
-        export.truncated_session_count
-    );
-    output.push_str(
-        "# HELP moshwatch_runtime_dropped_sessions_total Number of session tracking admissions or records dropped due to capacity limits.\n",
-    );
-    output.push_str("# TYPE moshwatch_runtime_dropped_sessions_total counter\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_runtime_dropped_sessions_total {}",
-        export.dropped_sessions_total
-    );
-    output.push_str(
-        "# HELP moshwatch_runtime_worker_threads Configured Tokio worker threads for moshwatchd.\n",
-    );
-    output.push_str("# TYPE moshwatch_runtime_worker_threads gauge\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_runtime_worker_threads {}",
-        DAEMON_WORKER_THREADS
-    );
-    output.push_str(
-        "# HELP moshwatch_runtime_loop_interval_ms Configured interval for periodic daemon loops in milliseconds.\n",
-    );
-    output.push_str("# TYPE moshwatch_runtime_loop_interval_ms gauge\n");
-    output.push_str(
-        "# HELP moshwatch_runtime_loop_last_duration_ms Last observed runtime for a periodic daemon loop in milliseconds.\n",
-    );
-    output.push_str("# TYPE moshwatch_runtime_loop_last_duration_ms gauge\n");
-    output.push_str(
-        "# HELP moshwatch_runtime_loop_overruns_total Number of times a periodic daemon loop took longer than its configured interval.\n",
-    );
-    output.push_str("# TYPE moshwatch_runtime_loop_overruns_total counter\n");
-    write_runtime_loop_metrics(
-        &mut output,
-        "discovery",
-        runtime.discovery_interval_ms,
-        runtime.discovery_last_duration_ms,
-        runtime.discovery_overruns_total,
-    );
-    write_runtime_loop_metrics(
-        &mut output,
-        "history",
-        runtime.history_interval_ms,
-        runtime.history_last_duration_ms,
-        runtime.history_overruns_total,
-    );
-    write_runtime_loop_metrics(
-        &mut output,
-        "snapshot",
-        runtime.snapshot_interval_ms,
-        runtime.snapshot_last_duration_ms,
-        runtime.snapshot_overruns_total,
-    );
-    output.push_str(
-        "# HELP moshwatch_history_current_bytes Current on-disk bytes retained in persistent history.\n",
-    );
-    output.push_str("# TYPE moshwatch_history_current_bytes gauge\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_history_current_bytes {}",
-        history.map_or(0, |stats| stats.current_bytes)
-    );
-    output.push_str(
-        "# HELP moshwatch_history_written_bytes_total Total history bytes successfully written to disk.\n",
-    );
-    output.push_str("# TYPE moshwatch_history_written_bytes_total counter\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_history_written_bytes_total {}",
-        history.map_or(0, |stats| stats.written_bytes_total)
-    );
-    output.push_str(
-        "# HELP moshwatch_history_write_failures_total Number of failed persistent history writes.\n",
-    );
-    output.push_str("# TYPE moshwatch_history_write_failures_total counter\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_history_write_failures_total {}",
-        history.map_or(0, |stats| stats.write_failures_total)
-    );
-    output.push_str(
-        "# HELP moshwatch_history_prune_failures_total Number of expired history files that failed to prune.\n",
-    );
-    output.push_str("# TYPE moshwatch_history_prune_failures_total counter\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_history_prune_failures_total {}",
-        history.map_or(0, |stats| stats.prune_failures_total)
-    );
-    output.push_str(
-        "# HELP moshwatch_history_dropped_samples_total Number of history samples dropped because persistence exceeded its disk budget.\n",
-    );
-    output.push_str("# TYPE moshwatch_history_dropped_samples_total counter\n");
-    let _ = writeln!(
-        output,
-        "moshwatch_history_dropped_samples_total {}",
-        history.map_or(0, |stats| stats.dropped_samples_total)
-    );
-
-    output.push_str("# HELP moshwatch_session_info Static session metadata.\n");
-    output.push_str("# TYPE moshwatch_session_info gauge\n");
-    output.push_str("# HELP moshwatch_session_health_level Session health severity: ok=0, degraded=1, critical=2, legacy=3.\n");
-    output.push_str("# TYPE moshwatch_session_health_level gauge\n");
-    output.push_str("# HELP moshwatch_session_srtt_ms Smoothed round-trip time in milliseconds.\n");
-    output.push_str("# TYPE moshwatch_session_srtt_ms gauge\n");
-    output.push_str("# HELP moshwatch_session_rttvar_ms RTT variance in milliseconds.\n");
-    output.push_str("# TYPE moshwatch_session_rttvar_ms gauge\n");
-    output.push_str("# HELP moshwatch_session_last_rtt_ms Latest RTT sample in milliseconds.\n");
-    output.push_str("# TYPE moshwatch_session_last_rtt_ms gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_last_heard_age_ms Age in milliseconds since the daemon last heard any packet from the peer.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_last_heard_age_ms gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_remote_state_age_ms Age in milliseconds since the peer last sent a new remote state.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_remote_state_age_ms gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmit_pct_10s Retransmit ratio over the last 10 seconds.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmit_pct_10s gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmit_pct_60s Retransmit ratio over the last 60 seconds.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmit_pct_60s gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmit_window_complete Whether the retransmit window is fully populated for a given session and window.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmit_window_complete gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmit_window_transmissions Number of transmissions counted inside the retransmit lookback window.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmit_window_transmissions gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmit_window_retransmits Number of retransmits counted inside the retransmit lookback window.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmit_window_retransmits gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmit_window_state_updates Number of state-update transmissions counted inside the retransmit lookback window.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmit_window_state_updates gauge\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmit_window_empty_acks Number of empty-ack transmissions counted inside the retransmit lookback window.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmit_window_empty_acks gauge\n");
-    output.push_str("# HELP moshwatch_session_packets_tx_total Total transmitted packets seen by the session.\n");
-    output.push_str("# TYPE moshwatch_session_packets_tx_total counter\n");
-    output.push_str(
-        "# HELP moshwatch_session_packets_rx_total Total received packets seen by the session.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_packets_rx_total counter\n");
-    output.push_str(
-        "# HELP moshwatch_session_retransmits_total Total retransmits seen by the session.\n",
-    );
-    output.push_str("# TYPE moshwatch_session_retransmits_total counter\n");
-
-    for session in &export.sessions {
-        let info_labels = info_metric_labels(session);
-        let value_labels = value_metric_labels(session);
-        let _ = writeln!(output, "moshwatch_session_info{{{info_labels}}} 1");
-        let _ = writeln!(
-            output,
-            "moshwatch_session_health_level{{{value_labels}}} {}",
-            health_level(&session.health)
-        );
-        write_optional_gauge(
-            &mut output,
-            "moshwatch_session_srtt_ms",
-            &value_labels,
-            session.metrics.srtt_ms,
-        );
-        write_optional_gauge(
-            &mut output,
-            "moshwatch_session_rttvar_ms",
-            &value_labels,
-            session.metrics.rttvar_ms,
-        );
-        write_optional_gauge(
-            &mut output,
-            "moshwatch_session_last_rtt_ms",
-            &value_labels,
-            session.metrics.last_rtt_ms,
-        );
-        write_optional_u64(
-            &mut output,
-            "moshwatch_session_last_heard_age_ms",
-            &value_labels,
-            session.metrics.last_heard_age_ms,
-        );
-        write_optional_u64(
-            &mut output,
-            "moshwatch_session_remote_state_age_ms",
-            &value_labels,
-            session.metrics.remote_state_age_ms,
-        );
-        write_optional_gauge(
-            &mut output,
-            "moshwatch_session_retransmit_pct_10s",
-            &value_labels,
-            session.metrics.retransmit_pct_10s,
-        );
-        write_optional_gauge(
-            &mut output,
-            "moshwatch_session_retransmit_pct_60s",
-            &value_labels,
-            session.metrics.retransmit_pct_60s,
-        );
-        write_window_complete(
-            &mut output,
-            &value_labels,
-            "10s",
-            session.metrics.retransmit_window_10s_complete,
-        );
-        write_window_complete(
-            &mut output,
-            &value_labels,
-            "60s",
-            session.metrics.retransmit_window_60s_complete,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_transmissions",
-            &value_labels,
-            "10s",
-            session
-                .metrics
-                .retransmit_window_10s_breakdown
-                .transmissions_total,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_transmissions",
-            &value_labels,
-            "60s",
-            session
-                .metrics
-                .retransmit_window_60s_breakdown
-                .transmissions_total,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_retransmits",
-            &value_labels,
-            "10s",
-            session
-                .metrics
-                .retransmit_window_10s_breakdown
-                .retransmits_total,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_retransmits",
-            &value_labels,
-            "60s",
-            session
-                .metrics
-                .retransmit_window_60s_breakdown
-                .retransmits_total,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_state_updates",
-            &value_labels,
-            "10s",
-            session
-                .metrics
-                .retransmit_window_10s_breakdown
-                .state_updates_total,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_state_updates",
-            &value_labels,
-            "60s",
-            session
-                .metrics
-                .retransmit_window_60s_breakdown
-                .state_updates_total,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_empty_acks",
-            &value_labels,
-            "10s",
-            session
-                .metrics
-                .retransmit_window_10s_breakdown
-                .empty_acks_total,
-        );
-        write_optional_window_u64(
-            &mut output,
-            "moshwatch_session_retransmit_window_empty_acks",
-            &value_labels,
-            "60s",
-            session
-                .metrics
-                .retransmit_window_60s_breakdown
-                .empty_acks_total,
-        );
-        write_optional_u64(
-            &mut output,
-            "moshwatch_session_packets_tx_total",
-            &value_labels,
-            session.metrics.packets_tx_total,
-        );
-        write_optional_u64(
-            &mut output,
-            "moshwatch_session_packets_rx_total",
-            &value_labels,
-            session.metrics.packets_rx_total,
-        );
-        write_optional_u64(
-            &mut output,
-            "moshwatch_session_retransmits_total",
-            &value_labels,
-            session.metrics.retransmits_total,
-        );
-    }
-
-    output
+    render_metric_samples(&samples, format)
 }
 
 pub async fn run_metrics_server(
@@ -409,6 +321,7 @@ pub async fn run_metrics_server(
     observer: ObserverInfo,
     listen_addr: String,
     auth_token: Arc<str>,
+    otlp_stats: OtlpExporterStats,
 ) -> Result<()> {
     let listener = TcpListener::bind(&listen_addr)
         .await
@@ -435,6 +348,7 @@ pub async fn run_metrics_server(
         let runtime_stats = runtime_stats.clone();
         let observer = observer.clone();
         let auth_token = auth_token.clone();
+        let otlp_stats = otlp_stats.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Err(error) = handle_metrics_connection(
@@ -444,12 +358,89 @@ pub async fn run_metrics_server(
                 runtime_stats,
                 observer,
                 auth_token,
+                otlp_stats,
             )
             .await
             {
                 tracing::warn!("metrics request from {peer_addr} failed: {error:#}");
             }
         });
+    }
+}
+
+pub async fn run_otlp_exporter(
+    state: SharedState,
+    history: Option<Arc<HistoryStore>>,
+    runtime_stats: RuntimeStats,
+    observer: ObserverInfo,
+    config: AppConfig,
+    stats: OtlpExporterStats,
+) -> Result<()> {
+    let endpoint = config.metrics.otlp.endpoint.clone();
+    let client = build_otlp_client(&config)?;
+    let headers = otlp_headers(&config)?;
+    let export_started_unix_nano = unix_nanos(moshwatch_core::time::unix_time_ms());
+    let mut ticker = interval(Duration::from_millis(
+        config.metrics.otlp.export_interval_ms,
+    ));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let cycle_started = Instant::now();
+        let now_ms = moshwatch_core::time::unix_time_ms();
+        let export = {
+            let guard = state.read().await;
+            guard.export_summaries(now_ms, MAX_METRICS_RENDERED_SESSIONS)
+        };
+        let samples = collect_metric_samples(
+            &config,
+            &observer,
+            &export,
+            history.as_ref().map(|store| store.stats_snapshot()),
+            runtime_stats.snapshot(),
+            &stats.snapshot().await,
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: config.metrics.otlp.detail_tier.includes_sessions(),
+            },
+        );
+        let payload = encode_otlp_metrics(
+            &observer,
+            &config,
+            &samples,
+            now_ms,
+            export_started_unix_nano,
+        )?;
+        let payload_bytes = payload.len() as u64;
+        let response_result = client
+            .post(&endpoint)
+            .headers(headers.clone())
+            .body(payload)
+            .send()
+            .await;
+        let duration_ms = u64::try_from(cycle_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match response_result {
+            Ok(response) => {
+                let finished_at = moshwatch_core::time::unix_time_ms();
+                if let Err(error) = handle_otlp_response(response).await {
+                    stats
+                        .record_failure(duration_ms, finished_at, payload_bytes)
+                        .await;
+                    tracing::warn!("otlp metrics export failed: {error:#}");
+                    continue;
+                }
+                stats
+                    .record_success(duration_ms, finished_at, payload_bytes)
+                    .await;
+            }
+            Err(error) => {
+                let finished_at = moshwatch_core::time::unix_time_ms();
+                stats
+                    .record_failure(duration_ms, finished_at, payload_bytes)
+                    .await;
+                tracing::warn!("otlp metrics export request failed: {error:#}");
+            }
+        }
     }
 }
 
@@ -460,10 +451,8 @@ async fn handle_metrics_connection(
     runtime_stats: RuntimeStats,
     observer: ObserverInfo,
     auth_token: Arc<str>,
+    otlp_stats: OtlpExporterStats,
 ) -> Result<()> {
-    // Unlike the owner-only Unix-socket API route, the TCP listener is always
-    // bearer-protected because network reachability is a broader trust
-    // boundary than local filesystem permissions.
     let request = timeout(Duration::from_secs(2), read_request_head(&mut stream))
         .await
         .context("read metrics request timed out")??;
@@ -508,15 +497,30 @@ async fn handle_metrics_connection(
     }
 
     let now_ms = moshwatch_core::time::unix_time_ms();
-    let export = {
+    let (export, config) = {
         let guard = state.read().await;
-        guard.export_summaries(now_ms, MAX_METRICS_RENDERED_SESSIONS)
+        (
+            guard.export_summaries(now_ms, MAX_METRICS_RENDERED_SESSIONS),
+            guard.config().clone(),
+        )
+    };
+    let Some(format) = requested_metrics_format(&request) else {
+        return write_response_with_timeout(
+            &mut stream,
+            406,
+            b"{\"error\":\"not acceptable\"}",
+            "application/json",
+        )
+        .await;
     };
     let body = render_metrics(
+        &config,
         &observer,
         &export,
         history.as_ref().map(|store| store.stats_snapshot()),
         runtime_stats.snapshot(),
+        otlp_stats.snapshot().await,
+        format,
     );
     timeout(
         METRICS_WRITE_TIMEOUT,
@@ -524,11 +528,845 @@ async fn handle_metrics_connection(
             &mut stream,
             200,
             body.as_bytes(),
-            "text/plain; version=0.0.4",
+            metrics_content_type(format),
         ),
     )
     .await
     .context("write metrics response timed out")?
+}
+
+fn collect_metric_samples(
+    config: &AppConfig,
+    observer: &ObserverInfo,
+    export: &ExportedSummaries,
+    history: Option<HistoryStatsSnapshot>,
+    runtime: RuntimeStatsSnapshot,
+    otlp_stats: &OtlpExporterStatsSnapshot,
+    options: MetricCollectionOptions,
+) -> HashMap<MetricId, Vec<MetricSample>> {
+    let mut samples = HashMap::<MetricId, Vec<MetricSample>>::new();
+    add_sample(
+        &mut samples,
+        MetricId::BuildInfo,
+        vec![("version", env!("CARGO_PKG_VERSION").to_string())],
+        1.0,
+    );
+    if options.include_observer_info {
+        add_sample(
+            &mut samples,
+            MetricId::ObserverInfo,
+            vec![
+                ("node_name", observer.node_name.clone()),
+                ("system_id", observer.system_id.clone()),
+            ],
+            1.0,
+        );
+    }
+    add_sample(
+        &mut samples,
+        MetricId::Sessions,
+        vec![("kind", "instrumented".to_string())],
+        export.instrumented_sessions as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::Sessions,
+        vec![("kind", "legacy".to_string())],
+        export.legacy_sessions as f64,
+    );
+
+    for count in &export.health_counts {
+        add_sample(
+            &mut samples,
+            MetricId::SessionsByHealth,
+            vec![
+                ("kind", kind_label(&count.kind).to_string()),
+                ("health", health_label(&count.health).to_string()),
+            ],
+            count.sessions as f64,
+        );
+    }
+
+    let rendered_sessions = if options.detail_tier.includes_sessions() {
+        export.sessions.len()
+    } else {
+        0
+    };
+    let truncated_sessions = if options.detail_tier.includes_sessions() {
+        export.truncated_session_count
+    } else {
+        0
+    };
+    add_sample(
+        &mut samples,
+        MetricId::MetricsRenderedSessions,
+        Vec::new(),
+        rendered_sessions as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::MetricsTruncatedSessions,
+        Vec::new(),
+        truncated_sessions as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::RuntimeDroppedSessionsTotal,
+        Vec::new(),
+        export.dropped_sessions_total as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::RuntimeWorkerThreads,
+        Vec::new(),
+        DAEMON_WORKER_THREADS as f64,
+    );
+    add_runtime_loop_samples(
+        &mut samples,
+        "discovery",
+        runtime.discovery_interval_ms,
+        runtime.discovery_last_duration_ms,
+        runtime.discovery_overruns_total,
+    );
+    add_runtime_loop_samples(
+        &mut samples,
+        "history",
+        runtime.history_interval_ms,
+        runtime.history_last_duration_ms,
+        runtime.history_overruns_total,
+    );
+    add_runtime_loop_samples(
+        &mut samples,
+        "snapshot",
+        runtime.snapshot_interval_ms,
+        runtime.snapshot_last_duration_ms,
+        runtime.snapshot_overruns_total,
+    );
+
+    let history = history.unwrap_or(HistoryStatsSnapshot {
+        current_bytes: 0,
+        written_bytes_total: 0,
+        write_failures_total: 0,
+        prune_failures_total: 0,
+        dropped_samples_total: 0,
+    });
+    add_sample(
+        &mut samples,
+        MetricId::HistoryCurrentBytes,
+        Vec::new(),
+        history.current_bytes as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::HistoryWrittenBytesTotal,
+        Vec::new(),
+        history.written_bytes_total as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::HistoryWriteFailuresTotal,
+        Vec::new(),
+        history.write_failures_total as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::HistoryPruneFailuresTotal,
+        Vec::new(),
+        history.prune_failures_total as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::HistoryDroppedSamplesTotal,
+        Vec::new(),
+        history.dropped_samples_total as f64,
+    );
+
+    add_sample(
+        &mut samples,
+        MetricId::ThresholdRttMs,
+        vec![("severity", "warn".to_string())],
+        config.thresholds.warn_rtt_ms as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::ThresholdRttMs,
+        vec![("severity", "critical".to_string())],
+        config.thresholds.critical_rtt_ms as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::ThresholdRetransmitPct,
+        vec![("severity", "warn".to_string())],
+        config.thresholds.warn_retransmit_pct,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::ThresholdRetransmitPct,
+        vec![("severity", "critical".to_string())],
+        config.thresholds.critical_retransmit_pct,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::ThresholdSilenceMs,
+        vec![("severity", "warn".to_string())],
+        config.thresholds.warn_silence_ms as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::ThresholdSilenceMs,
+        vec![("severity", "critical".to_string())],
+        config.thresholds.critical_silence_ms as f64,
+    );
+
+    add_sample(
+        &mut samples,
+        MetricId::OtlpExportEnabled,
+        vec![(
+            "detail_tier",
+            detail_tier_label(config.metrics.otlp.detail_tier).to_string(),
+        )],
+        if config.metrics.otlp.enabled {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    add_sample(
+        &mut samples,
+        MetricId::OtlpExportsTotal,
+        vec![("result", "success".to_string())],
+        otlp_stats.success_total as f64,
+    );
+    add_sample(
+        &mut samples,
+        MetricId::OtlpExportsTotal,
+        vec![("result", "failure".to_string())],
+        otlp_stats.failure_total as f64,
+    );
+    add_optional_sample(
+        &mut samples,
+        MetricId::OtlpExportLastDurationMs,
+        Vec::new(),
+        otlp_stats.last_duration_ms.map(|value| value as f64),
+    );
+    add_optional_sample(
+        &mut samples,
+        MetricId::OtlpExportLastSuccessUnixMs,
+        Vec::new(),
+        otlp_stats.last_success_unix_ms.map(|value| value as f64),
+    );
+    add_optional_sample(
+        &mut samples,
+        MetricId::OtlpExportLastFailureUnixMs,
+        Vec::new(),
+        otlp_stats.last_failure_unix_ms.map(|value| value as f64),
+    );
+    add_optional_sample(
+        &mut samples,
+        MetricId::OtlpExportLastPayloadBytes,
+        Vec::new(),
+        otlp_stats.last_payload_bytes.map(|value| value as f64),
+    );
+
+    if options.detail_tier.includes_sessions() {
+        for session in &export.sessions {
+            let info_labels = session_info_labels(session);
+            let value_labels = session_value_labels(session);
+            add_sample(&mut samples, MetricId::SessionInfo, info_labels, 1.0);
+            add_sample(
+                &mut samples,
+                MetricId::SessionHealthLevel,
+                value_labels.clone(),
+                health_level(&session.health) as f64,
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionSrttMs,
+                value_labels.clone(),
+                session.metrics.srtt_ms,
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRttvarMs,
+                value_labels.clone(),
+                session.metrics.rttvar_ms,
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionLastRttMs,
+                value_labels.clone(),
+                session.metrics.last_rtt_ms,
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionLastHeardAgeMs,
+                value_labels.clone(),
+                session.metrics.last_heard_age_ms.map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRemoteStateAgeMs,
+                value_labels.clone(),
+                session
+                    .metrics
+                    .remote_state_age_ms
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitPct10s,
+                value_labels.clone(),
+                session.metrics.retransmit_pct_10s,
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitPct60s,
+                value_labels.clone(),
+                session.metrics.retransmit_pct_60s,
+            );
+            add_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowComplete,
+                window_labels(&value_labels, "10s"),
+                if session.metrics.retransmit_window_10s_complete {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            add_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowComplete,
+                window_labels(&value_labels, "60s"),
+                if session.metrics.retransmit_window_60s_complete {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowTransmissions,
+                window_labels(&value_labels, "10s"),
+                session
+                    .metrics
+                    .retransmit_window_10s_breakdown
+                    .transmissions_total
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowTransmissions,
+                window_labels(&value_labels, "60s"),
+                session
+                    .metrics
+                    .retransmit_window_60s_breakdown
+                    .transmissions_total
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowRetransmits,
+                window_labels(&value_labels, "10s"),
+                session
+                    .metrics
+                    .retransmit_window_10s_breakdown
+                    .retransmits_total
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowRetransmits,
+                window_labels(&value_labels, "60s"),
+                session
+                    .metrics
+                    .retransmit_window_60s_breakdown
+                    .retransmits_total
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowStateUpdates,
+                window_labels(&value_labels, "10s"),
+                session
+                    .metrics
+                    .retransmit_window_10s_breakdown
+                    .state_updates_total
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowStateUpdates,
+                window_labels(&value_labels, "60s"),
+                session
+                    .metrics
+                    .retransmit_window_60s_breakdown
+                    .state_updates_total
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowEmptyAcks,
+                window_labels(&value_labels, "10s"),
+                session
+                    .metrics
+                    .retransmit_window_10s_breakdown
+                    .empty_acks_total
+                    .map(|value| value as f64),
+            );
+            add_optional_sample(
+                &mut samples,
+                MetricId::SessionRetransmitWindowEmptyAcks,
+                window_labels(&value_labels, "60s"),
+                session
+                    .metrics
+                    .retransmit_window_60s_breakdown
+                    .empty_acks_total
+                    .map(|value| value as f64),
+            );
+            let counter_start_ms = session
+                .counter_reset_unix_ms
+                .unwrap_or(session.started_at_unix_ms);
+            add_optional_counter_sample(
+                &mut samples,
+                MetricId::SessionPacketsTxTotal,
+                value_labels.clone(),
+                counter_start_ms,
+                session.metrics.packets_tx_total.map(|value| value as f64),
+            );
+            add_optional_counter_sample(
+                &mut samples,
+                MetricId::SessionPacketsRxTotal,
+                value_labels.clone(),
+                counter_start_ms,
+                session.metrics.packets_rx_total.map(|value| value as f64),
+            );
+            add_optional_counter_sample(
+                &mut samples,
+                MetricId::SessionRetransmitsTotal,
+                value_labels,
+                counter_start_ms,
+                session.metrics.retransmits_total.map(|value| value as f64),
+            );
+        }
+    }
+
+    samples
+}
+
+fn render_metric_samples(
+    samples: &HashMap<MetricId, Vec<MetricSample>>,
+    format: MetricsTextFormat,
+) -> String {
+    let mut output = String::new();
+    for descriptor in moshwatch_core::metric_catalog() {
+        let Some(series) = samples.get(&descriptor.id) else {
+            continue;
+        };
+        let _ = writeln!(output, "# HELP {} {}", descriptor.name, descriptor.help);
+        let _ = writeln!(
+            output,
+            "# TYPE {} {}",
+            descriptor.name,
+            metric_type_text(descriptor, format)
+        );
+        for sample in series {
+            render_metric_sample(&mut output, descriptor, sample);
+        }
+    }
+    if format == MetricsTextFormat::OpenMetricsText {
+        output.push_str("# EOF\n");
+    }
+    output
+}
+
+fn render_metric_sample(output: &mut String, descriptor: &MetricDescriptor, sample: &MetricSample) {
+    if sample.labels.is_empty() {
+        let _ = writeln!(output, "{} {}", descriptor.name, sample.value);
+        return;
+    }
+    output.push_str(descriptor.name);
+    output.push('{');
+    for (index, (name, value)) in sample.labels.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push_str(name);
+        output.push_str("=\"");
+        output.push_str(&escape_label(value));
+        output.push('\"');
+    }
+    output.push_str("} ");
+    let _ = writeln!(output, "{}", sample.value);
+}
+
+fn metric_type_text(descriptor: &MetricDescriptor, format: MetricsTextFormat) -> &'static str {
+    match descriptor.kind {
+        MetricType::Gauge => "gauge",
+        MetricType::Counter => "counter",
+        MetricType::Info => match format {
+            MetricsTextFormat::PrometheusText => "gauge",
+            MetricsTextFormat::OpenMetricsText => "info",
+        },
+    }
+}
+
+fn add_sample(
+    samples: &mut HashMap<MetricId, Vec<MetricSample>>,
+    id: MetricId,
+    labels: Vec<(&'static str, String)>,
+    value: f64,
+) {
+    add_sample_with_start_time(samples, id, labels, value, None);
+}
+
+fn add_sample_with_start_time(
+    samples: &mut HashMap<MetricId, Vec<MetricSample>>,
+    id: MetricId,
+    labels: Vec<(&'static str, String)>,
+    value: f64,
+    start_time_unix_nano: Option<u64>,
+) {
+    samples.entry(id).or_default().push(MetricSample {
+        labels,
+        value,
+        start_time_unix_nano,
+    });
+}
+
+fn add_optional_sample(
+    samples: &mut HashMap<MetricId, Vec<MetricSample>>,
+    id: MetricId,
+    labels: Vec<(&'static str, String)>,
+    value: Option<f64>,
+) {
+    if let Some(value) = value {
+        add_sample(samples, id, labels, value);
+    }
+}
+
+fn add_optional_counter_sample(
+    samples: &mut HashMap<MetricId, Vec<MetricSample>>,
+    id: MetricId,
+    labels: Vec<(&'static str, String)>,
+    start_unix_ms: i64,
+    value: Option<f64>,
+) {
+    if let Some(value) = value {
+        add_sample_with_start_time(samples, id, labels, value, Some(unix_nanos(start_unix_ms)));
+    }
+}
+
+fn add_runtime_loop_samples(
+    samples: &mut HashMap<MetricId, Vec<MetricSample>>,
+    loop_name: &str,
+    interval_ms: u64,
+    last_duration_ms: u64,
+    overruns_total: u64,
+) {
+    if interval_ms == 0 {
+        return;
+    }
+    let labels = vec![("loop", loop_name.to_string())];
+    add_sample(
+        samples,
+        MetricId::RuntimeLoopIntervalMs,
+        labels.clone(),
+        interval_ms as f64,
+    );
+    add_sample(
+        samples,
+        MetricId::RuntimeLoopLastDurationMs,
+        labels.clone(),
+        last_duration_ms as f64,
+    );
+    add_sample(
+        samples,
+        MetricId::RuntimeLoopOverrunsTotal,
+        labels,
+        overruns_total as f64,
+    );
+}
+
+fn session_info_labels(session: &SessionSummary) -> Vec<(&'static str, String)> {
+    vec![
+        ("session_id", session.session_id.clone()),
+        (
+            "display_session_id",
+            session.display_session_id.clone().unwrap_or_default(),
+        ),
+        ("kind", kind_label(&session.kind).to_string()),
+        ("pid", session.pid.to_string()),
+        ("started_at_unix_ms", session.started_at_unix_ms.to_string()),
+    ]
+}
+
+fn session_value_labels(session: &SessionSummary) -> Vec<(&'static str, String)> {
+    vec![
+        ("session_id", session.session_id.clone()),
+        ("kind", kind_label(&session.kind).to_string()),
+    ]
+}
+
+fn window_labels(labels: &[(&'static str, String)], window: &str) -> Vec<(&'static str, String)> {
+    let mut combined = labels.to_vec();
+    combined.push(("window", window.to_string()));
+    combined
+}
+
+fn detail_tier_label(detail_tier: MetricsDetailLevel) -> &'static str {
+    match detail_tier {
+        MetricsDetailLevel::AggregateOnly => "aggregate_only",
+        MetricsDetailLevel::PerSession => "per_session",
+    }
+}
+
+fn kind_label(kind: &SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Instrumented => "instrumented",
+        SessionKind::Legacy => "legacy",
+    }
+}
+
+fn health_label(health: &HealthState) -> &'static str {
+    match health {
+        HealthState::Ok => "ok",
+        HealthState::Degraded => "degraded",
+        HealthState::Critical => "critical",
+        HealthState::Legacy => "legacy",
+    }
+}
+
+fn health_level(health: &HealthState) -> u8 {
+    match health {
+        HealthState::Ok => 0,
+        HealthState::Degraded => 1,
+        HealthState::Critical => 2,
+        HealthState::Legacy => 3,
+    }
+}
+
+fn build_otlp_client(config: &AppConfig) -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_millis(config.metrics.otlp.timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build OTLP HTTP client")
+}
+
+fn otlp_headers(config: &AppConfig) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in &config.metrics.otlp.headers {
+        let header_name = HeaderName::try_from(name.as_str())
+            .with_context(|| format!("parse OTLP header name {name}"))?;
+        let header_value = HeaderValue::from_str(value)
+            .with_context(|| format!("parse OTLP header value for {name}"))?;
+        headers.insert(header_name, header_value);
+    }
+    // Always force the protobuf content negotiation required by the OTLP/HTTP payload.
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/x-protobuf"),
+    );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/x-protobuf"));
+    Ok(headers)
+}
+
+async fn handle_otlp_response(response: reqwest::Response) -> Result<()> {
+    let status = response.status();
+    let body = read_otlp_response_body(response).await?;
+    if !status.is_success() {
+        let snippet = String::from_utf8_lossy(&body);
+        anyhow::bail!(
+            "collector responded with {}: {}",
+            status,
+            truncate_for_log(&snippet, 256)
+        );
+    }
+    if body.is_empty() {
+        return Ok(());
+    }
+    let response = ExportMetricsServiceResponse::decode(body.as_ref())
+        .context("decode OTLP protobuf response")?;
+    handle_otlp_partial_success(response.partial_success)?;
+    Ok(())
+}
+
+fn handle_otlp_partial_success(partial_success: Option<ExportMetricsPartialSuccess>) -> Result<()> {
+    if let Some(partial) = partial_success {
+        if partial.rejected_data_points > 0 {
+            anyhow::bail!(
+                "collector reported partial success: rejected_data_points={}, error_message={}",
+                partial.rejected_data_points,
+                partial.error_message
+            );
+        }
+        if !partial.error_message.trim().is_empty() {
+            tracing::warn!(
+                "collector reported warning-only partial success: {}",
+                truncate_for_log(&partial.error_message, 256)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn read_otlp_response_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length()
+        && length > MAX_OTLP_RESPONSE_BYTES as u64
+    {
+        anyhow::bail!(
+            "collector response body ({} bytes) exceeds {} byte limit",
+            length,
+            MAX_OTLP_RESPONSE_BYTES
+        );
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("read OTLP response chunk")? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_OTLP_RESPONSE_BYTES {
+            anyhow::bail!(
+                "collector response body exceeded {} bytes",
+                MAX_OTLP_RESPONSE_BYTES
+            );
+        }
+    }
+    Ok(body)
+}
+
+fn encode_otlp_metrics(
+    observer: &ObserverInfo,
+    config: &AppConfig,
+    samples: &HashMap<MetricId, Vec<MetricSample>>,
+    now_unix_ms: i64,
+    export_started_unix_nano: u64,
+) -> Result<Vec<u8>> {
+    let now_unix_nano = unix_nanos(now_unix_ms);
+    let metrics = moshwatch_core::metric_catalog()
+        .iter()
+        .filter_map(|descriptor| {
+            samples
+                .get(&descriptor.id)
+                .filter(|series| !series.is_empty())
+                .map(|series| {
+                    metric_to_otlp(descriptor, series, now_unix_nano, export_started_unix_nano)
+                })
+        })
+        .collect();
+    let mut resource_attributes = vec![
+        string_attribute("service.name", "moshwatchd"),
+        string_attribute("service.version", env!("CARGO_PKG_VERSION")),
+    ];
+    if config.metrics.otlp.detail_tier.includes_sessions() {
+        resource_attributes.push(string_attribute("service.instance.id", &observer.system_id));
+        resource_attributes.push(string_attribute(
+            "moshwatch.observer.node_name",
+            &observer.node_name,
+        ));
+        resource_attributes.push(string_attribute(
+            "moshwatch.observer.system_id",
+            &observer.system_id,
+        ));
+    }
+    for (key, value) in &config.metrics.otlp.resource_attributes {
+        anyhow::ensure!(
+            !moshwatch_core::config::is_reserved_otlp_resource_attribute_key(key),
+            "metrics.otlp.resource_attributes cannot override reserved OTLP key {key}"
+        );
+        resource_attributes.push(string_attribute(key, value));
+    }
+    let request = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: OTLP_INSTRUMENTATION_SCOPE.to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    attributes: Vec::new(),
+                    dropped_attributes_count: 0,
+                }),
+                metrics,
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    Ok(request.encode_to_vec())
+}
+
+fn metric_to_otlp(
+    descriptor: &MetricDescriptor,
+    samples: &[MetricSample],
+    now_unix_nano: u64,
+    export_started_unix_nano: u64,
+) -> Metric {
+    let data_points = samples
+        .iter()
+        .map(|sample| NumberDataPoint {
+            attributes: sample
+                .labels
+                .iter()
+                .map(|(name, value)| string_attribute(name, value))
+                .collect(),
+            start_time_unix_nano: if matches!(descriptor.kind, MetricType::Counter) {
+                sample
+                    .start_time_unix_nano
+                    .unwrap_or(export_started_unix_nano)
+            } else {
+                0
+            },
+            time_unix_nano: now_unix_nano,
+            exemplars: Vec::new(),
+            flags: 0,
+            value: Some(number_data_point::Value::AsDouble(sample.value)),
+        })
+        .collect();
+    let data = match descriptor.kind {
+        MetricType::Counter => metric::Data::Sum(Sum {
+            data_points,
+            aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            is_monotonic: true,
+        }),
+        MetricType::Gauge | MetricType::Info => metric::Data::Gauge(Gauge { data_points }),
+    };
+    Metric {
+        name: descriptor.name.to_string(),
+        description: descriptor.help.to_string(),
+        unit: metric_unit(descriptor).to_string(),
+        metadata: Vec::new(),
+        data: Some(data),
+    }
+}
+
+fn metric_unit(descriptor: &MetricDescriptor) -> &'static str {
+    descriptor.unit
+}
+
+fn string_attribute(name: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: name.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_string())),
+        }),
+    }
+}
+
+fn unix_nanos(unix_ms: i64) -> u64 {
+    let clamped_ms = unix_ms.max(0);
+    u64::try_from(clamped_ms)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000)
+}
+
+fn truncate_for_log(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    value.chars().take(limit).collect::<String>() + "..."
 }
 
 async fn read_request_head<S>(stream: &mut S) -> Result<String>
@@ -585,6 +1423,7 @@ where
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         408 => "Request Timeout",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
@@ -665,117 +1504,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn info_metric_labels(session: &SessionSummary) -> String {
-    let display_id = session.display_session_id.as_deref().unwrap_or("");
-    let bind_addr = session.bind_addr.as_deref().unwrap_or("");
-    let client_addr = session.client_addr.as_deref().unwrap_or("");
-    let current_client_addr = session.peer.current_client_addr.as_deref().unwrap_or("");
-    let udp_port = session
-        .udp_port
-        .map(|value| value.to_string())
-        .unwrap_or_default();
-    format!(
-        "session_id=\"{}\",display_session_id=\"{}\",kind=\"{}\",pid=\"{}\",started_at_unix_ms=\"{}\",bind_addr=\"{}\",udp_port=\"{}\",client_addr=\"{}\",current_client_addr=\"{}\"",
-        escape_label(&session.session_id),
-        escape_label(display_id),
-        escape_label(match session.kind {
-            moshwatch_core::SessionKind::Instrumented => "instrumented",
-            moshwatch_core::SessionKind::Legacy => "legacy",
-        }),
-        session.pid,
-        session.started_at_unix_ms,
-        escape_label(bind_addr),
-        escape_label(&udp_port),
-        escape_label(client_addr),
-        escape_label(current_client_addr),
-    )
-}
-
-fn value_metric_labels(session: &SessionSummary) -> String {
-    let display_id = session.display_session_id.as_deref().unwrap_or("");
-    format!(
-        "session_id=\"{}\",display_session_id=\"{}\",kind=\"{}\"",
-        escape_label(&session.session_id),
-        escape_label(display_id),
-        escape_label(match session.kind {
-            moshwatch_core::SessionKind::Instrumented => "instrumented",
-            moshwatch_core::SessionKind::Legacy => "legacy",
-        }),
-    )
-}
-
-fn health_level(health: &HealthState) -> u8 {
-    match health {
-        HealthState::Ok => 0,
-        HealthState::Degraded => 1,
-        HealthState::Critical => 2,
-        HealthState::Legacy => 3,
-    }
-}
-
-fn write_optional_gauge(output: &mut String, name: &str, labels: &str, value: Option<f64>) {
-    if let Some(value) = value {
-        let _ = writeln!(output, "{name}{{{labels}}} {value}");
-    }
-}
-
-fn write_optional_u64(output: &mut String, name: &str, labels: &str, value: Option<u64>) {
-    if let Some(value) = value {
-        let _ = writeln!(output, "{name}{{{labels}}} {value}");
-    }
-}
-
-fn write_window_complete(output: &mut String, labels: &str, window: &str, complete: bool) {
-    let _ = writeln!(
-        output,
-        "moshwatch_session_retransmit_window_complete{{{labels},window=\"{}\"}} {}",
-        escape_label(window),
-        if complete { 1 } else { 0 }
-    );
-}
-
-fn write_optional_window_u64(
-    output: &mut String,
-    name: &str,
-    labels: &str,
-    window: &str,
-    value: Option<u64>,
-) {
-    let Some(value) = value else {
-        return;
-    };
-    let _ = writeln!(
-        output,
-        "{name}{{{labels},window=\"{}\"}} {value}",
-        escape_label(window)
-    );
-}
-
-fn write_runtime_loop_metrics(
-    output: &mut String,
-    loop_name: &str,
-    interval_ms: u64,
-    last_duration_ms: u64,
-    overruns_total: u64,
-) {
-    if interval_ms == 0 {
-        return;
-    }
-    let loop_name = escape_label(loop_name);
-    let _ = writeln!(
-        output,
-        "moshwatch_runtime_loop_interval_ms{{loop=\"{loop_name}\"}} {interval_ms}"
-    );
-    let _ = writeln!(
-        output,
-        "moshwatch_runtime_loop_last_duration_ms{{loop=\"{loop_name}\"}} {last_duration_ms}"
-    );
-    let _ = writeln!(
-        output,
-        "moshwatch_runtime_loop_overruns_total{{loop=\"{loop_name}\"}} {overruns_total}"
-    );
-}
-
 fn escape_label(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -786,60 +1514,138 @@ fn escape_label(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use moshwatch_core::{
-        HealthState, ObserverInfo, RetransmitWindowBreakdown, SessionKind, SessionMetrics,
-        SessionPeerInfo, SessionSummary,
+        AppConfig, MetricsDetailTier, ObserverInfo, RetransmitWindowBreakdown, SessionKind,
+        SessionMetrics, SessionPeerInfo, SessionSummary,
+    };
+    use opentelemetry_proto::tonic::{
+        collector::metrics::v1::ExportMetricsServiceRequest, common::v1::any_value::Value,
+        metrics::v1::metric,
+    };
+    use prost::Message;
+
+    use super::{
+        ExportMetricsPartialSuccess, MetricCollectionOptions, MetricsTextFormat,
+        OtlpExporterStatsSnapshot, build_otlp_client, collect_metric_samples, encode_otlp_metrics,
+        extract_bearer_token, handle_otlp_partial_success, metrics_request_is_authorized,
+        otlp_headers, render_metrics, requested_metrics_format, unix_nanos,
+    };
+    use crate::runtime_stats::RuntimeStatsSnapshot;
+    use crate::{
+        history::HistoryStatsSnapshot,
+        state::{ExportedSummaries, SessionHealthCount},
     };
 
-    use super::{extract_bearer_token, metrics_request_is_authorized, render_metrics};
-    use crate::runtime_stats::RuntimeStatsSnapshot;
-    use crate::{history::HistoryStatsSnapshot, state::ExportedSummaries};
+    fn sample_export() -> ExportedSummaries {
+        ExportedSummaries {
+            total_sessions: 1,
+            truncated_session_count: 2,
+            instrumented_sessions: 1,
+            legacy_sessions: 0,
+            health_counts: vec![
+                SessionHealthCount {
+                    kind: SessionKind::Instrumented,
+                    health: moshwatch_core::HealthState::Ok,
+                    sessions: 0,
+                },
+                SessionHealthCount {
+                    kind: SessionKind::Instrumented,
+                    health: moshwatch_core::HealthState::Degraded,
+                    sessions: 1,
+                },
+                SessionHealthCount {
+                    kind: SessionKind::Instrumented,
+                    health: moshwatch_core::HealthState::Critical,
+                    sessions: 0,
+                },
+                SessionHealthCount {
+                    kind: SessionKind::Instrumented,
+                    health: moshwatch_core::HealthState::Legacy,
+                    sessions: 0,
+                },
+                SessionHealthCount {
+                    kind: SessionKind::Legacy,
+                    health: moshwatch_core::HealthState::Ok,
+                    sessions: 0,
+                },
+                SessionHealthCount {
+                    kind: SessionKind::Legacy,
+                    health: moshwatch_core::HealthState::Degraded,
+                    sessions: 0,
+                },
+                SessionHealthCount {
+                    kind: SessionKind::Legacy,
+                    health: moshwatch_core::HealthState::Critical,
+                    sessions: 0,
+                },
+                SessionHealthCount {
+                    kind: SessionKind::Legacy,
+                    health: moshwatch_core::HealthState::Legacy,
+                    sessions: 0,
+                },
+            ],
+            dropped_sessions_total: 7,
+            sessions: vec![SessionSummary {
+                session_id: "instrumented:1:42".to_string(),
+                display_session_id: Some("display".to_string()),
+                pid: 42,
+                kind: SessionKind::Instrumented,
+                health: moshwatch_core::HealthState::Degraded,
+                started_at_unix_ms: 1,
+                last_observed_unix_ms: 2,
+                bind_addr: Some("127.0.0.1".to_string()),
+                udp_port: Some(60001),
+                client_addr: Some("192.0.2.10:60001".to_string()),
+                peer: SessionPeerInfo {
+                    current_client_addr: Some("192.0.2.10:60001".to_string()),
+                    last_client_addr: Some("192.0.2.10:60001".to_string()),
+                    ..SessionPeerInfo::default()
+                },
+                cmdline: "mosh-server-real".to_string(),
+                counter_reset_unix_ms: None,
+                metrics: SessionMetrics {
+                    srtt_ms: Some(12.5),
+                    last_heard_age_ms: Some(250),
+                    remote_state_age_ms: Some(1_250),
+                    retransmit_pct_10s: Some(1.2),
+                    retransmit_window_10s_complete: true,
+                    retransmit_window_10s_breakdown: RetransmitWindowBreakdown {
+                        transmissions_total: Some(25),
+                        retransmits_total: Some(1),
+                        state_updates_total: Some(20),
+                        empty_acks_total: Some(4),
+                    },
+                    packets_tx_total: Some(250),
+                    packets_rx_total: Some(240),
+                    retransmits_total: Some(3),
+                    ..SessionMetrics::default()
+                },
+            }],
+        }
+    }
+
+    fn sample_runtime() -> RuntimeStatsSnapshot {
+        RuntimeStatsSnapshot {
+            discovery_interval_ms: 5_000,
+            discovery_last_duration_ms: 20,
+            discovery_overruns_total: 1,
+            history_interval_ms: 10_000,
+            history_last_duration_ms: 15,
+            history_overruns_total: 0,
+            snapshot_interval_ms: 1_000,
+            snapshot_last_duration_ms: 4,
+            snapshot_overruns_total: 2,
+        }
+    }
 
     #[test]
-    fn renders_prometheus_metrics_for_sessions() {
+    fn renders_session_metrics_without_volatile_network_labels() {
         let metrics = render_metrics(
+            &AppConfig::default(),
             &ObserverInfo {
                 node_name: "node-1".to_string(),
                 system_id: "system-1".to_string(),
             },
-            &ExportedSummaries {
-                total_sessions: 1,
-                truncated_session_count: 2,
-                instrumented_sessions: 1,
-                legacy_sessions: 0,
-                dropped_sessions_total: 7,
-                sessions: vec![SessionSummary {
-                    session_id: "instrumented:1:42".to_string(),
-                    display_session_id: Some("display".to_string()),
-                    pid: 42,
-                    kind: SessionKind::Instrumented,
-                    health: HealthState::Degraded,
-                    started_at_unix_ms: 1,
-                    last_observed_unix_ms: 2,
-                    bind_addr: Some("127.0.0.1".to_string()),
-                    udp_port: Some(60001),
-                    client_addr: Some("192.0.2.10:60001".to_string()),
-                    peer: SessionPeerInfo {
-                        current_client_addr: Some("192.0.2.10:60001".to_string()),
-                        last_client_addr: Some("192.0.2.10:60001".to_string()),
-                        ..SessionPeerInfo::default()
-                    },
-                    cmdline: "mosh-server-real".to_string(),
-                    metrics: SessionMetrics {
-                        srtt_ms: Some(12.5),
-                        last_heard_age_ms: Some(250),
-                        remote_state_age_ms: Some(1_250),
-                        retransmit_pct_10s: Some(1.2),
-                        retransmit_window_10s_complete: true,
-                        retransmit_window_10s_breakdown: RetransmitWindowBreakdown {
-                            transmissions_total: Some(25),
-                            retransmits_total: Some(1),
-                            state_updates_total: Some(20),
-                            empty_acks_total: Some(4),
-                        },
-                        ..SessionMetrics::default()
-                    },
-                }],
-            },
+            &sample_export(),
             Some(HistoryStatsSnapshot {
                 current_bytes: 1024,
                 written_bytes_total: 4096,
@@ -847,34 +1653,20 @@ mod tests {
                 prune_failures_total: 5,
                 dropped_samples_total: 3,
             }),
-            RuntimeStatsSnapshot {
-                discovery_interval_ms: 5_000,
-                discovery_last_duration_ms: 20,
-                discovery_overruns_total: 1,
-                history_interval_ms: 10_000,
-                history_last_duration_ms: 15,
-                history_overruns_total: 0,
-                snapshot_interval_ms: 1_000,
-                snapshot_last_duration_ms: 4,
-                snapshot_overruns_total: 2,
-            },
+            sample_runtime(),
+            OtlpExporterStatsSnapshot::default(),
+            MetricsTextFormat::PrometheusText,
         );
 
         assert!(metrics.contains("moshwatch_build_info"));
-        assert!(
-            metrics
-                .contains("moshwatch_observer_info{node_name=\"node-1\",system_id=\"system-1\"} 1")
-        );
+        assert!(metrics.contains("moshwatch_sessions_by_health"));
         assert!(metrics.contains("moshwatch_session_srtt_ms"));
-        assert!(metrics.contains("moshwatch_session_last_heard_age_ms"));
-        assert!(metrics.contains("moshwatch_session_remote_state_age_ms"));
         assert!(metrics.contains("display_session_id=\"display\""));
         assert!(metrics.contains("moshwatch_session_retransmit_window_complete"));
         assert!(metrics.contains("window=\"10s\""));
         assert!(metrics.contains("moshwatch_session_retransmit_window_transmissions"));
         assert!(metrics.contains("moshwatch_session_retransmit_window_retransmits"));
-        assert!(metrics.contains("client_addr=\"192.0.2.10:60001\""));
-        assert!(metrics.contains("current_client_addr=\"192.0.2.10:60001\""));
+        assert!(metrics.contains("moshwatch_observer_info"));
         assert!(metrics.contains("moshwatch_metrics_truncated_sessions 2"));
         assert!(metrics.contains("moshwatch_runtime_dropped_sessions_total 7"));
         assert!(metrics.contains("moshwatch_runtime_worker_threads 2"));
@@ -886,52 +1678,138 @@ mod tests {
         assert!(metrics.contains("moshwatch_history_write_failures_total 2"));
         assert!(metrics.contains("moshwatch_history_prune_failures_total 5"));
         assert!(metrics.contains("moshwatch_history_dropped_samples_total 3"));
-        assert!(
-            !metrics.contains(
-                "moshwatch_session_srtt_ms{session_id=\"instrumented:1:42\",display_session_id=\"display\",kind=\"instrumented\",pid=\"42\""
-            )
-        );
+        assert!(!metrics.contains("bind_addr="));
+        assert!(!metrics.contains("udp_port="));
+        assert!(!metrics.contains("client_addr="));
+        assert!(!metrics.contains(",display_session_id=\"display\",kind=\"instrumented\"} 12.5"));
     }
 
     #[test]
-    fn preserves_compatible_and_current_peer_metric_labels() {
+    fn aggregate_only_detail_hides_session_series() {
+        let mut config = AppConfig::default();
+        config.metrics.prometheus.detail_tier = moshwatch_core::MetricsDetailTier::AggregateOnly;
         let metrics = render_metrics(
+            &config,
             &ObserverInfo {
                 node_name: "node-1".to_string(),
                 system_id: "system-1".to_string(),
             },
-            &ExportedSummaries {
-                total_sessions: 1,
-                truncated_session_count: 0,
-                instrumented_sessions: 1,
-                legacy_sessions: 0,
-                dropped_sessions_total: 0,
-                sessions: vec![SessionSummary {
-                    session_id: "instrumented:1:42".to_string(),
-                    display_session_id: Some("display".to_string()),
-                    pid: 42,
-                    kind: SessionKind::Instrumented,
-                    health: HealthState::Ok,
-                    started_at_unix_ms: 1,
-                    last_observed_unix_ms: 2,
-                    bind_addr: Some("127.0.0.1".to_string()),
-                    udp_port: Some(60001),
-                    client_addr: Some("192.0.2.10:60001".to_string()),
-                    peer: SessionPeerInfo {
-                        current_client_addr: None,
-                        last_client_addr: Some("192.0.2.10:60001".to_string()),
-                        ..SessionPeerInfo::default()
-                    },
-                    cmdline: "mosh-server-real".to_string(),
-                    metrics: SessionMetrics::default(),
-                }],
-            },
+            &sample_export(),
             None,
-            RuntimeStatsSnapshot::default(),
+            sample_runtime(),
+            OtlpExporterStatsSnapshot::default(),
+            MetricsTextFormat::PrometheusText,
         );
 
-        assert!(metrics.contains("client_addr=\"192.0.2.10:60001\""));
-        assert!(metrics.contains("current_client_addr=\"\""));
+        assert!(metrics.contains("moshwatch_sessions{kind=\"instrumented\"} 1"));
+        assert!(metrics.contains("moshwatch_metrics_rendered_sessions 0"));
+        assert!(!metrics.contains("moshwatch_observer_info"));
+        assert!(!metrics.contains("moshwatch_session_srtt_ms"));
+        assert!(!metrics.contains("moshwatch_session_info"));
+    }
+
+    #[test]
+    fn openmetrics_accept_negotiation_is_supported() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; version=1.0.0\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::OpenMetricsText)
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_q_values_choose_the_higher_preference() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; q=0.2, application/openmetrics-text; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::OpenMetricsText)
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_application_wildcard_matches_openmetrics() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/*\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::OpenMetricsText)
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_star_wildcard_still_respects_quality() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; q=0.2, */*; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::OpenMetricsText)
+        );
+    }
+
+    #[test]
+    fn explicit_text_plain_beats_wildcard_at_equal_quality() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: */*; q=0.8, text/plain; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::PrometheusText)
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_q_zero_falls_back_to_prometheus_text() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; q=0, text/plain\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::PrometheusText)
+        );
+    }
+
+    #[test]
+    fn openmetrics_accept_version_mismatch_does_not_win_negotiation() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; version=0.0.1, text/plain; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::PrometheusText)
+        );
+    }
+
+    #[test]
+    fn prometheus_accept_version_mismatch_does_not_win_negotiation() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; version=1.0.0, application/openmetrics-text; q=0.8\r\n\r\n";
+        assert_eq!(
+            requested_metrics_format(request),
+            Some(MetricsTextFormat::OpenMetricsText)
+        );
+    }
+
+    #[test]
+    fn unsupported_accept_header_returns_no_compatible_metrics_format() {
+        let request =
+            "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n";
+        assert_eq!(requested_metrics_format(request), None);
+    }
+
+    #[test]
+    fn q_zero_for_both_supported_metrics_formats_is_not_acceptable() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; q=0, text/plain; q=0\r\n\r\n";
+        assert_eq!(requested_metrics_format(request), None);
+    }
+
+    #[test]
+    fn openmetrics_render_uses_info_metric_type_for_info_series() {
+        let metrics = render_metrics(
+            &AppConfig::default(),
+            &ObserverInfo {
+                node_name: "node-1".to_string(),
+                system_id: "system-1".to_string(),
+            },
+            &sample_export(),
+            None,
+            sample_runtime(),
+            OtlpExporterStatsSnapshot::default(),
+            MetricsTextFormat::OpenMetricsText,
+        );
+        assert!(metrics.contains("# TYPE moshwatch_build_info info"));
+        assert!(metrics.contains("# TYPE moshwatch_session_info info"));
+        assert!(metrics.ends_with("# EOF\n"));
     }
 
     #[test]
@@ -952,5 +1830,327 @@ mod tests {
             "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
             "expected-token"
         ));
+    }
+
+    #[tokio::test]
+    async fn otlp_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect test listener");
+        let endpoint = format!(
+            "http://{}/v1/metrics",
+            listener.local_addr().expect("listener addr")
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept redirect request");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read redirect request");
+            socket
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/v1/metrics\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("write redirect response");
+        });
+
+        let mut config = AppConfig::default();
+        config.metrics.otlp.endpoint = endpoint.clone();
+        config.metrics.otlp.timeout_ms = 1_000;
+
+        let response = build_otlp_client(&config)
+            .expect("build OTLP client")
+            .post(endpoint)
+            .body(Vec::new())
+            .send()
+            .await
+            .expect("OTLP request should return redirect response without following");
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[test]
+    fn otlp_headers_force_required_protobuf_content_negotiation() {
+        let mut config = AppConfig::default();
+        config
+            .metrics
+            .otlp
+            .headers
+            .insert("authorization".to_string(), "Bearer test".to_string());
+        config
+            .metrics
+            .otlp
+            .headers
+            .insert("accept".to_string(), "text/plain".to_string());
+        config
+            .metrics
+            .otlp
+            .headers
+            .insert("content-type".to_string(), "application/json".to_string());
+
+        let headers = otlp_headers(&config).expect("build OTLP headers");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test")
+        );
+        assert_eq!(
+            headers.get("accept").and_then(|value| value.to_str().ok()),
+            Some("application/x-protobuf")
+        );
+        assert_eq!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/x-protobuf")
+        );
+    }
+
+    #[test]
+    fn otlp_partial_success_warning_only_is_non_fatal() {
+        let partial_success = ExportMetricsPartialSuccess {
+            rejected_data_points: 0,
+            error_message: "collector note".to_string(),
+        };
+
+        handle_otlp_partial_success(Some(partial_success))
+            .expect("warning-only partial success should not fail");
+    }
+
+    #[test]
+    fn otlp_partial_success_with_rejections_is_fatal() {
+        let partial_success = ExportMetricsPartialSuccess {
+            rejected_data_points: 3,
+            error_message: "rejected".to_string(),
+        };
+
+        let err = handle_otlp_partial_success(Some(partial_success))
+            .expect_err("rejected data points should fail");
+        assert!(
+            err.to_string().contains("rejected_data_points"),
+            "error should mention rejected points: {err}"
+        );
+    }
+
+    #[test]
+    fn otlp_session_counters_preserve_session_start_time() {
+        let observer = ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        };
+        let mut config = AppConfig::default();
+        config.metrics.otlp.detail_tier = MetricsDetailTier::PerSession;
+        let export = sample_export();
+        let samples = collect_metric_samples(
+            &config,
+            &observer,
+            &export,
+            None,
+            sample_runtime(),
+            &OtlpExporterStatsSnapshot::default(),
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: true,
+            },
+        );
+        let payload = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
+            .expect("encode OTLP metrics");
+        let request = ExportMetricsServiceRequest::decode(payload.as_slice())
+            .expect("decode OTLP metrics payload");
+        let resource_attributes = &request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource")
+            .attributes;
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.node_name")
+        );
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.system_id")
+        );
+
+        let session_packets = metrics
+            .iter()
+            .find(|metric| metric.name == "moshwatch_session_packets_tx_total")
+            .expect("session packets counter metric");
+        let history_written = metrics
+            .iter()
+            .find(|metric| metric.name == "moshwatch_history_written_bytes_total")
+            .expect("history counter metric");
+
+        let session_start = match session_packets.data.as_ref().expect("session packets data") {
+            metric::Data::Sum(sum) => sum.data_points[0].start_time_unix_nano,
+            other => panic!("expected Sum data for session packets, got {other:?}"),
+        };
+        let exporter_start = match history_written.data.as_ref().expect("history data") {
+            metric::Data::Sum(sum) => sum.data_points[0].start_time_unix_nano,
+            other => panic!("expected Sum data for history bytes, got {other:?}"),
+        };
+
+        assert_eq!(
+            session_start,
+            unix_nanos(export.sessions[0].started_at_unix_ms)
+        );
+        assert_eq!(exporter_start, unix_nanos(9_000));
+    }
+
+    #[test]
+    fn aggregate_only_otlp_omits_builtin_instance_identity() {
+        let observer = ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        };
+        let mut config = AppConfig::default();
+        config.metrics.otlp.detail_tier = MetricsDetailTier::AggregateOnly;
+        let export = sample_export();
+        let samples = collect_metric_samples(
+            &config,
+            &observer,
+            &export,
+            None,
+            sample_runtime(),
+            &OtlpExporterStatsSnapshot::default(),
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: false,
+            },
+        );
+        let payload = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
+            .expect("encode OTLP metrics");
+        let request = ExportMetricsServiceRequest::decode(payload.as_slice())
+            .expect("decode OTLP metrics payload");
+        let resource_attributes = &request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource")
+            .attributes;
+
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "service.name")
+        );
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "service.version")
+        );
+        assert!(
+            !resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.node_name")
+        );
+        assert!(
+            !resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.system_id")
+        );
+        assert!(
+            !resource_attributes
+                .iter()
+                .any(|attr| attr.key == "service.instance.id")
+        );
+    }
+
+    #[test]
+    fn otlp_session_export_includes_builtin_instance_identity() {
+        let observer = ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        };
+        let mut config = AppConfig::default();
+        config.metrics.otlp.detail_tier = MetricsDetailTier::PerSession;
+        let export = sample_export();
+        let samples = collect_metric_samples(
+            &config,
+            &observer,
+            &export,
+            None,
+            sample_runtime(),
+            &OtlpExporterStatsSnapshot::default(),
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: true,
+            },
+        );
+        let payload = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
+            .expect("encode OTLP metrics");
+        let request = ExportMetricsServiceRequest::decode(payload.as_slice())
+            .expect("decode OTLP metrics payload");
+        let resource_attributes = &request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource")
+            .attributes;
+
+        assert!(resource_attributes.iter().any(|attr| {
+            attr.key == "service.instance.id"
+                && matches!(
+                    attr.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value == "system-1"
+                )
+        }));
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.node_name")
+        );
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.system_id")
+        );
+    }
+
+    #[test]
+    fn otlp_resource_attributes_reject_reserved_keys() {
+        let observer = ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        };
+        let export = sample_export();
+        let samples = collect_metric_samples(
+            &AppConfig::default(),
+            &observer,
+            &export,
+            None,
+            sample_runtime(),
+            &OtlpExporterStatsSnapshot::default(),
+            MetricCollectionOptions {
+                detail_tier: MetricsDetailTier::AggregateOnly,
+                include_observer_info: false,
+            },
+        );
+
+        for reserved_key in [
+            "service.name",
+            "service.version",
+            "service.instance.id",
+            "moshwatch.observer.node_name",
+            "moshwatch.observer.system_id",
+        ] {
+            let mut config = AppConfig::default();
+            config.metrics.otlp.resource_attributes =
+                std::collections::BTreeMap::from([(reserved_key.to_string(), "value".to_string())]);
+
+            let err = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
+                .expect_err("reserved OTLP resource key should be rejected");
+            assert!(
+                err.to_string().contains(reserved_key),
+                "error should mention reserved key {reserved_key}: {err}"
+            );
+        }
     }
 }

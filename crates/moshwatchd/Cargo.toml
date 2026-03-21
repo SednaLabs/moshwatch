@@ -11,6 +11,9 @@ anyhow.workspace = true
 clap.workspace = true
 libc = "0.2.177"
 moshwatch-core = { path = "../moshwatch-core" }
+opentelemetry-proto.workspace = true
+prost.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

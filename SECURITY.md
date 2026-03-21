@@ -26,6 +26,7 @@ Older versions may be closed out with upgrade guidance instead of a backport.
 - local operator sockets should remain private to the current Unix user
 - long-lived history should remain bounded under hostile but valid load
 - TCP metrics should not be readable by other local users without an auth token
+- OTLP egress should remain an explicit operator decision with secret handling
 - public network exposure should require an explicit operator decision
 - host attribution should be explicit for observability consumers, but easy to
   redact before public sharing
@@ -39,6 +40,7 @@ In practice that means:
 - API and telemetry sockets are created with owner-only permissions
 - TCP metrics require `Authorization: Bearer <token>`
 - non-loopback TCP metrics binds are rejected by default
+- OTLP metrics export is disabled by default and configured separately from Prometheus scraping
 - persistent history is constrained by retention and a hard disk budget
 
 ## Non-Goals
@@ -91,6 +93,28 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/moshwatch/metrics.token
 
 and is created with mode `0600`.
 
+### OTLP metrics export
+
+OTLP export is disabled by default. When enabled, the daemon becomes an outbound
+HTTP client and any configured OTLP headers become secret material.
+
+Treat the following as sensitive:
+
+- `[metrics.otlp].headers` values
+- collector URLs that reveal internal topology
+- resource attributes that identify private hosts, tenants, or environments
+
+Recommended posture:
+
+- keep the collector on loopback when possible
+- prefer HTTPS when OTLP leaves the host
+- prefer mTLS or a private network when collector traffic crosses trust boundaries
+- inject live OTLP headers from the environment or a secret manager instead of
+  committing them to a repo
+
+The default generated examples use a loopback OTLP/HTTP collector endpoint and
+do not contain live secrets.
+
 The daemon also exposes host attribution through:
 
 - JSON `observer` objects in API responses and event-stream frames
@@ -108,12 +132,14 @@ before they can be replayed through the API.
 
 If you intentionally bind metrics off loopback, you must opt in with either:
 
-- `metrics.allow_non_loopback = true`
+- `metrics.prometheus.allow_non_loopback = true`
 - `--allow-public-metrics`
 
 That opt-in does not replace normal network controls. If you expose the TCP
 listener beyond the host, you still need to decide how the bearer token is
-protected in transit and where that listener is reachable.
+protected in transit and where that listener is reachable. The same principle
+applies to OTLP: if exporter traffic leaves the host, you still need to define
+how it is authenticated, encrypted, and segmented.
 
 ## Handling Sensitive Material
 
@@ -126,6 +152,13 @@ protected in transit and where that listener is reachable.
 - if the token is exposed, stop the service, delete the token file, and start
   the service again to rotate it
 
+### Protect OTLP headers and collector config
+
+- do not commit live OTLP header values into repo-owned example files
+- treat collector URLs, tenant headers, API keys, and bearer tokens as secrets
+- prefer environment-variable or secret-manager injection for live collector auth
+- redact OTLP headers, collector URLs, and private resource attributes from
+  screenshots, dashboards, exported configs, and issue reports
 
 ### Redact observer identity in public reports
 
