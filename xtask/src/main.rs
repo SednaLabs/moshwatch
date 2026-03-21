@@ -1181,7 +1181,27 @@ fn upsert_managed_block(path: &Path, block: &str, placement: Placement) -> Resul
         }
     };
     let mode = file_mode_or_default(path, 0o644);
-    install_text_file(path, &updated, mode)
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        install_text_file_through_symlink(path, &updated, mode)
+    } else {
+        install_text_file(path, &updated, mode)
+    }
+}
+
+fn install_text_file_through_symlink(destination: &Path, contents: &str, mode: u32) -> Result<()> {
+    // Follow the symlink target instead of renaming over the symlink so dotfile
+    // managers such as Stow or chezmoi keep control of the link itself.
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(destination)
+        .with_context(|| format!("open {}", destination.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("write {}", destination.display()))?;
+    file.flush()
+        .with_context(|| format!("flush {}", destination.display()))?;
+    set_mode_if_unix(destination, mode)
 }
 
 fn strip_managed_block(contents: &str) -> String {
@@ -1554,6 +1574,29 @@ mod tests {
         let contents = fs::read_to_string(&path).expect("read");
         assert_eq!(contents.matches(PATH_BLOCK_START).count(), 1);
         assert!(contents.starts_with(PATH_BLOCK_START));
+    }
+
+    #[test]
+    fn upsert_managed_block_preserves_symlinked_rc_file() {
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join(".bashrc");
+        let target = tempdir.path().join("dotfiles/.bashrc");
+        fs::create_dir_all(target.parent().expect("target parent")).expect("create target dir");
+        fs::write(&target, "existing\n").expect("write target");
+        symlink(&target, &path).expect("create symlink");
+        let block = format!("{PATH_BLOCK_START}\nmanaged\n{PATH_BLOCK_END}\n");
+        let expected = format!("{block}\nexisting\n");
+
+        upsert_managed_block(&path, &block, Placement::Prepend).expect("upsert symlinked rc");
+
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("stat symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).expect("read target"), expected);
+        assert_eq!(fs::read_to_string(&path).expect("read symlink"), expected);
     }
 
     #[test]
