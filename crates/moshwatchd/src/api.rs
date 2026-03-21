@@ -280,7 +280,7 @@ async fn build_response(
     method: &str,
     path: &str,
     query: Option<&str>,
-    metrics_format: MetricsTextFormat,
+    metrics_format: Option<MetricsTextFormat>,
     context: AppContext,
 ) -> Result<(u16, Vec<u8>, &'static str)> {
     let now_ms = moshwatch_core::time::unix_time_ms();
@@ -318,6 +318,13 @@ async fn build_response(
             )
         }
         ("GET", "/metrics") => {
+            let Some(metrics_format) = metrics_format else {
+                return Ok((
+                    406,
+                    b"{\"error\":\"not acceptable\"}".to_vec(),
+                    "application/json",
+                ));
+            };
             let (config, export) = {
                 let guard = context.state.read().await;
                 (
@@ -643,6 +650,7 @@ where
         404 => "Not Found",
         409 => "Conflict",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         408 => "Request Timeout",
         501 => "Not Implemented",
         503 => "Service Unavailable",
@@ -765,9 +773,25 @@ mod tests {
     }
 
     async fn request_method(socket_path: &Path, method: &str, target: &str) -> String {
+        request_method_with_headers(socket_path, method, target, &[]).await
+    }
+
+    async fn request_method_with_headers(
+        socket_path: &Path,
+        method: &str,
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
         let mut stream = UnixStream::connect(socket_path).await.expect("connect");
-        let request =
-            format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut request =
+            format!("{method} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        for (name, value) in headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
         stream
             .write_all(request.as_bytes())
             .await
@@ -864,7 +888,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
-        assert_eq!(body["schema_version"], 3);
+        assert_eq!(body["schema_version"], API_SCHEMA_VERSION);
         assert_eq!(body["observer"]["node_name"], "node-1");
         assert_eq!(body["observer"]["system_id"], "system-1");
         assert_eq!(body["total_sessions"], 1);
@@ -966,7 +990,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
-        assert_eq!(body["schema_version"], 3);
+        assert_eq!(body["schema_version"], API_SCHEMA_VERSION);
         assert_eq!(
             body["session"]["peer"]["current_client_addr"],
             serde_json::Value::Null
@@ -1010,6 +1034,30 @@ mod tests {
         );
         assert!(response.contains("moshwatch_session_srtt_ms"));
         assert!(response.contains("display_session_id=\"display-1\""));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_not_acceptable_for_unsupported_accept() {
+        let tempdir = tempdir().expect("tempdir");
+        let socket_path = tempdir.path().join("api.sock");
+        let state = Arc::new(RwLock::new(ServiceState::new(AppConfig::default())));
+        let snapshots = SnapshotHub::new(observer());
+
+        let task = spawn_api(state, snapshots, None, &socket_path).await;
+        wait_for_socket(&socket_path).await;
+
+        let response = request_method_with_headers(
+            &socket_path,
+            "GET",
+            "/metrics",
+            &[("Accept", "application/json")],
+        )
+        .await;
+        task.abort();
+
+        assert!(response.starts_with("HTTP/1.1 406 Not Acceptable"));
+        let body = json_body(&response);
+        assert_eq!(body["error"], "not acceptable");
     }
 
     #[tokio::test]
@@ -1058,7 +1106,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         let body = json_body(&response);
-        assert_eq!(body["schema_version"], 3);
+        assert_eq!(body["schema_version"], API_SCHEMA_VERSION);
         assert_eq!(body["observer"]["node_name"], "node-1");
         assert_eq!(body["observer"]["system_id"], "system-1");
         assert_eq!(body["session_id"], session_id);

@@ -17,7 +17,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use http::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
+use http::{
+    Uri,
+    header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -415,9 +418,11 @@ impl AppConfig {
             anyhow::bail!("metrics.prometheus.listen_addr cannot be empty when provided");
         }
         if self.metrics.otlp.enabled {
-            if self.metrics.otlp.endpoint.trim().is_empty() {
+            let endpoint = self.metrics.otlp.endpoint.trim();
+            if endpoint.is_empty() {
                 anyhow::bail!("metrics.otlp.endpoint cannot be empty when OTLP export is enabled");
             }
+            validate_otlp_endpoint(endpoint)?;
             if self.metrics.otlp.export_interval_ms == 0 {
                 anyhow::bail!("metrics.otlp.export_interval_ms must be greater than zero");
             }
@@ -460,6 +465,31 @@ fn validate_otlp_header(name: &str, value: &str) -> Result<()> {
     HeaderValue::from_str(value).with_context(|| {
         format!("metrics.otlp.headers contains invalid HTTP header value for {name:?}")
     })?;
+    Ok(())
+}
+
+fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
+    if !endpoint.contains("://") {
+        anyhow::bail!(
+            "metrics.otlp.endpoint must include http:// or https:// scheme: {endpoint:?}"
+        );
+    }
+    let parsed = endpoint
+        .parse::<Uri>()
+        .with_context(|| format!("metrics.otlp.endpoint must be a valid HTTP URL: {endpoint:?}"))?;
+    let Some(scheme) = parsed.scheme_str() else {
+        anyhow::bail!(
+            "metrics.otlp.endpoint must include http:// or https:// scheme: {endpoint:?}"
+        );
+    };
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!("metrics.otlp.endpoint must use http or https scheme: {endpoint:?}");
+    }
+    if parsed.authority().is_none() {
+        anyhow::bail!(
+            "metrics.otlp.endpoint must include a host (and optional port): {endpoint:?}"
+        );
+    }
     Ok(())
 }
 
@@ -1277,6 +1307,41 @@ accept = "text/plain"
             error
                 .to_string()
                 .contains("cannot override reserved OTLP header")
+        );
+    }
+
+    #[test]
+    fn otlp_endpoint_requires_http_or_https_scheme() {
+        let missing_scheme: AppConfig = toml::from_str(
+            r#"
+[metrics.otlp]
+enabled = true
+endpoint = "127.0.0.1:4318/v1/metrics"
+"#,
+        )
+        .expect("parse config with missing OTLP endpoint scheme");
+        let err = missing_scheme
+            .validate()
+            .expect_err("missing OTLP endpoint scheme should be rejected");
+        assert!(
+            err.to_string().contains("must include http:// or https://"),
+            "unexpected missing-scheme error: {err}"
+        );
+
+        let unsupported_scheme: AppConfig = toml::from_str(
+            r#"
+[metrics.otlp]
+enabled = true
+endpoint = "udp://127.0.0.1:4318/v1/metrics"
+"#,
+        )
+        .expect("parse config with unsupported OTLP endpoint scheme");
+        let err = unsupported_scheme
+            .validate()
+            .expect_err("unsupported OTLP endpoint scheme should be rejected");
+        assert!(
+            err.to_string().contains("must use http or https"),
+            "unexpected unsupported-scheme error: {err}"
         );
     }
 

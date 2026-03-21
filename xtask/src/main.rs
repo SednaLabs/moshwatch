@@ -582,10 +582,29 @@ upsert_managed_block() {{
 
     if [[ -f "$file_path" ]]; then
         awk -v start="$PATH_BLOCK_START" -v end="$PATH_BLOCK_END" '
-            BEGIN {{ skipping = 0 }}
-            $0 == start {{ skipping = 1; next }}
-            skipping && $0 == end {{ skipping = 0; next }}
-            !skipping {{ print }}
+            BEGIN {{ skipping = 0; buffered_lines = 0 }}
+            !skipping && $0 == start {{
+                skipping = 1
+                buffered_lines = 0
+                buffered[buffered_lines++] = $0
+                next
+            }}
+            skipping {{
+                buffered[buffered_lines++] = $0
+                if ($0 == end) {{
+                    skipping = 0
+                    buffered_lines = 0
+                }}
+                next
+            }}
+            {{ print }}
+            END {{
+                if (skipping) {{
+                    for (idx = 0; idx < buffered_lines; idx++) {{
+                        print buffered[idx]
+                    }}
+                }}
+            }}
         ' "$file_path" > "$tmp_file"
     else
         : > "$tmp_file"
@@ -1633,6 +1652,9 @@ mod tests {
         assert!(script.contains("cat \"$next_file\" > \"$file_path\""));
         assert!(script.contains("mv \"$next_file\" \"$file_path\""));
         assert!(script.contains("rm -f \"$tmp_file\" \"$next_file\""));
+        assert!(script.contains("buffered[buffered_lines++] = $0"));
+        assert!(script.contains("if (skipping) {"));
+        assert!(script.contains("print buffered[idx]"));
     }
 
     #[test]

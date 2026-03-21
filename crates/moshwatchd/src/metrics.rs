@@ -119,8 +119,9 @@ pub fn metrics_content_type(format: MetricsTextFormat) -> &'static str {
     }
 }
 
-pub fn requested_metrics_format(request: &str) -> MetricsTextFormat {
+pub fn requested_metrics_format(request: &str) -> Option<MetricsTextFormat> {
     let mut preference = AcceptPreference::default();
+    let mut saw_accept_header = false;
     for line in request.lines().skip(1) {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
@@ -132,15 +133,24 @@ pub fn requested_metrics_format(request: &str) -> MetricsTextFormat {
         if !name.eq_ignore_ascii_case("accept") {
             continue;
         }
+        saw_accept_header = true;
         let parsed = accept_header_preference(value);
         preference.openmetrics = merge_accept_match(preference.openmetrics, parsed.openmetrics);
         preference.text_plain = merge_accept_match(preference.text_plain, parsed.text_plain);
     }
     if preference.prefers_openmetrics() {
-        MetricsTextFormat::OpenMetricsText
-    } else {
-        MetricsTextFormat::PrometheusText
+        return Some(MetricsTextFormat::OpenMetricsText);
     }
+    if preference
+        .text_plain
+        .is_some_and(|text_plain| text_plain.quality > 0.0)
+    {
+        return Some(MetricsTextFormat::PrometheusText);
+    }
+    if !saw_accept_header {
+        return Some(MetricsTextFormat::PrometheusText);
+    }
+    None
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -261,12 +271,8 @@ fn accept_item_quality(
 }
 
 fn accept_media_type_matches(candidate: &str, expected: &str) -> Option<u8> {
-    let Some((candidate_type, candidate_subtype)) = candidate.split_once('/') else {
-        return None;
-    };
-    let Some((expected_type, expected_subtype)) = expected.split_once('/') else {
-        return None;
-    };
+    let (candidate_type, candidate_subtype) = candidate.split_once('/')?;
+    let (expected_type, expected_subtype) = expected.split_once('/')?;
 
     let candidate_type = candidate_type.trim();
     let candidate_subtype = candidate_subtype.trim();
@@ -498,7 +504,15 @@ async fn handle_metrics_connection(
             guard.config().clone(),
         )
     };
-    let format = requested_metrics_format(&request);
+    let Some(format) = requested_metrics_format(&request) else {
+        return write_response_with_timeout(
+            &mut stream,
+            406,
+            b"{\"error\":\"not acceptable\"}",
+            "application/json",
+        )
+        .await;
+    };
     let body = render_metrics(
         &config,
         &observer,
@@ -1409,6 +1423,7 @@ where
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         408 => "Request Timeout",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
@@ -1698,7 +1713,7 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; version=1.0.0\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::OpenMetricsText
+            Some(MetricsTextFormat::OpenMetricsText)
         );
     }
 
@@ -1707,7 +1722,7 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; q=0.2, application/openmetrics-text; q=0.8\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::OpenMetricsText
+            Some(MetricsTextFormat::OpenMetricsText)
         );
     }
 
@@ -1716,7 +1731,7 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/*\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::OpenMetricsText
+            Some(MetricsTextFormat::OpenMetricsText)
         );
     }
 
@@ -1725,7 +1740,7 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; q=0.2, */*; q=0.8\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::OpenMetricsText
+            Some(MetricsTextFormat::OpenMetricsText)
         );
     }
 
@@ -1734,7 +1749,7 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: */*; q=0.8, text/plain; q=0.8\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::PrometheusText
+            Some(MetricsTextFormat::PrometheusText)
         );
     }
 
@@ -1743,7 +1758,7 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; q=0, text/plain\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::PrometheusText
+            Some(MetricsTextFormat::PrometheusText)
         );
     }
 
@@ -1752,7 +1767,7 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; version=0.0.1, text/plain; q=0.8\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::PrometheusText
+            Some(MetricsTextFormat::PrometheusText)
         );
     }
 
@@ -1761,8 +1776,21 @@ mod tests {
         let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain; version=1.0.0, application/openmetrics-text; q=0.8\r\n\r\n";
         assert_eq!(
             requested_metrics_format(request),
-            MetricsTextFormat::OpenMetricsText
+            Some(MetricsTextFormat::OpenMetricsText)
         );
+    }
+
+    #[test]
+    fn unsupported_accept_header_returns_no_compatible_metrics_format() {
+        let request =
+            "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n";
+        assert_eq!(requested_metrics_format(request), None);
+    }
+
+    #[test]
+    fn q_zero_for_both_supported_metrics_formats_is_not_acceptable() {
+        let request = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nAccept: application/openmetrics-text; q=0, text/plain; q=0\r\n\r\n";
+        assert_eq!(requested_metrics_format(request), None);
     }
 
     #[test]

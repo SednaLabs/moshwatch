@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 /// Version number for the exported API and event-stream schema.
 ///
 /// Bump this only when a consumer-visible contract changes.
-pub const API_SCHEMA_VERSION: u32 = 3;
+pub const API_SCHEMA_VERSION: u32 = 4;
 
-/// Schema version implied by REST responses from daemons older than v3.
+/// Schema version implied by REST responses from daemons older than v4.
 pub const LEGACY_REST_SCHEMA_VERSION: u32 = 2;
 
 fn default_rest_schema_version() -> u32 {
@@ -431,6 +431,9 @@ pub struct HistorySample {
     pub health: HealthState,
     /// Process start time in Unix milliseconds.
     pub started_at_unix_ms: i64,
+    /// When telemetry counters were last reset during this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_reset_unix_ms: Option<i64>,
     /// Bound local address when known.
     pub bind_addr: Option<String>,
     /// Bound UDP port when known.
@@ -558,8 +561,9 @@ mod tests {
 
     use super::{
         ApiConfigResponse, ApiHistoryResponse, ApiSessionControlResponse, ApiSessionResponse,
-        ApiSessionsResponse, HealthState, LEGACY_REST_SCHEMA_VERSION, SessionControlAction,
-        SessionKind, SessionMetrics, SessionPeerInfo, SessionSummary, classify_health,
+        ApiSessionsResponse, HealthState, HistorySample, LEGACY_REST_SCHEMA_VERSION,
+        SessionControlAction, SessionKind, SessionMetrics, SessionPeerInfo, SessionSummary,
+        classify_health,
     };
     use crate::{
         config::{AppConfig, HealthThresholds},
@@ -671,6 +675,50 @@ mod tests {
         ))
         .expect("decode history response without schema_version");
         assert_eq!(history.schema_version, LEGACY_REST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn history_sample_defaults_counter_reset_marker_when_missing() {
+        let payload = serde_json::json!({
+            "observer": observer(),
+            "recorded_at_unix_ms": 2_000,
+            "session_id": "instrumented:1000:42",
+            "display_session_id": "display-1",
+            "pid": 42,
+            "kind": "instrumented",
+            "health": "ok",
+            "started_at_unix_ms": 1_000,
+            "bind_addr": "127.0.0.1",
+            "udp_port": 60001,
+            "client_addr": "192.0.2.1:60001",
+            "current_client_addr": "192.0.2.1:60001",
+            "metrics": SessionMetrics::default(),
+        });
+        let sample: HistorySample =
+            serde_json::from_value(payload).expect("decode history sample without reset marker");
+        assert_eq!(sample.counter_reset_unix_ms, None);
+    }
+
+    #[test]
+    fn history_sample_serializes_counter_reset_marker_when_present() {
+        let sample = HistorySample {
+            observer: Some(observer()),
+            recorded_at_unix_ms: 2_000,
+            session_id: "instrumented:1000:42".to_string(),
+            display_session_id: Some("display-1".to_string()),
+            pid: 42,
+            kind: SessionKind::Instrumented,
+            health: HealthState::Ok,
+            started_at_unix_ms: 1_000,
+            counter_reset_unix_ms: Some(1_500),
+            bind_addr: Some("127.0.0.1".to_string()),
+            udp_port: Some(60001),
+            client_addr: Some("192.0.2.1:60001".to_string()),
+            current_client_addr: Some("192.0.2.1:60001".to_string()),
+            metrics: SessionMetrics::default(),
+        };
+        let encoded = serde_json::to_value(sample).expect("encode history sample");
+        assert_eq!(encoded["counter_reset_unix_ms"], serde_json::json!(1_500));
     }
 
     #[test]
