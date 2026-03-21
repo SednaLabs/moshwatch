@@ -14,6 +14,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -57,13 +58,13 @@ fn main() -> Result<()> {
     match command.as_str() {
         "build" => {
             let root = repo_root()?;
-            let source_metadata = resolve_source_metadata(&root, "HEAD")?;
-            build_all(&root, source_metadata.source_date_epoch)
+            let source_date_epoch = local_build_source_date_epoch(&root)?;
+            build_all(&root, source_date_epoch)
         }
         "install" => {
             let root = repo_root()?;
-            let source_metadata = resolve_source_metadata(&root, "HEAD")?;
-            build_all(&root, source_metadata.source_date_epoch)?;
+            let source_date_epoch = local_build_source_date_epoch(&root)?;
+            build_all(&root, source_date_epoch)?;
             install_artifacts()?;
             install_wrapper()?;
             install_shell_integration()?;
@@ -307,6 +308,42 @@ fn resolve_source_metadata(root: &Path, source_ref: &str) -> Result<SourceMetada
         source_commit_unix_ts,
         source_date_epoch: source_commit_unix_ts,
     })
+}
+
+fn local_build_source_date_epoch(root: &Path) -> Result<u64> {
+    local_build_source_date_epoch_from(root, |key| env::var_os(key), current_unix_time_secs)
+}
+
+fn local_build_source_date_epoch_from<F, G>(
+    root: &Path,
+    mut lookup: F,
+    now_unix_time_secs: G,
+) -> Result<u64>
+where
+    F: FnMut(&str) -> Option<OsString>,
+    G: FnOnce() -> Result<u64>,
+{
+    if let Some(value) = lookup("SOURCE_DATE_EPOCH") {
+        return parse_source_date_epoch(value);
+    }
+    if root.join(".git").exists() {
+        return Ok(resolve_source_metadata(root, "HEAD")?.source_date_epoch);
+    }
+    now_unix_time_secs()
+}
+
+fn parse_source_date_epoch(value: OsString) -> Result<u64> {
+    value
+        .to_string_lossy()
+        .parse::<u64>()
+        .with_context(|| format!("parse SOURCE_DATE_EPOCH value {:?}", value))
+}
+
+fn current_unix_time_secs() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?
+        .as_secs())
 }
 
 fn resolve_release_source_ref(root: &Path, tag: &str) -> Result<String> {
@@ -1380,6 +1417,7 @@ fn set_mode_if_unix(_path: &Path, _mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         fs,
         os::unix::{fs::PermissionsExt, fs::symlink},
         path::Path,
@@ -1389,10 +1427,11 @@ mod tests {
 
     use super::{
         MoshServerBuildInfo, PATH_BLOCK_END, PATH_BLOCK_START, Placement, install_binary,
-        install_text_file, release_artifact_paths, render_release_install_script, render_template,
-        sha256_hex, stage_release_tree, strip_managed_block, tool_command_from_environment,
-        upsert_managed_block, validate_release_tree, vendored_build_environment_from,
-        write_mosh_server_build_info, write_sha256_sums,
+        install_text_file, local_build_source_date_epoch_from, release_artifact_paths,
+        render_release_install_script, render_template, sha256_hex, stage_release_tree,
+        strip_managed_block, tool_command_from_environment, upsert_managed_block,
+        validate_release_tree, vendored_build_environment_from, write_mosh_server_build_info,
+        write_sha256_sums,
     };
 
     #[test]
@@ -1520,6 +1559,48 @@ mod tests {
         assert_eq!(environment["CFLAGS"], "-O2");
         assert_eq!(environment["ARFLAGS"], "crs");
         assert_eq!(environment["SOURCE_DATE_EPOCH"], "1701234567");
+    }
+
+    #[test]
+    fn local_build_source_date_epoch_uses_gitless_fallback_when_no_repo_metadata_exists() {
+        let tempdir = tempdir().expect("tempdir");
+        let now_called = Cell::new(false);
+        let epoch = local_build_source_date_epoch_from(
+            tempdir.path(),
+            |_| None,
+            || {
+                now_called.set(true);
+                Ok(1_701_234_567)
+            },
+        )
+        .expect("resolve local build source date epoch");
+
+        assert!(now_called.get());
+        assert_eq!(epoch, 1_701_234_567);
+    }
+
+    #[test]
+    fn local_build_source_date_epoch_prefers_explicit_override() {
+        let tempdir = tempdir().expect("tempdir");
+        let now_called = Cell::new(false);
+        let epoch = local_build_source_date_epoch_from(
+            tempdir.path(),
+            |key| {
+                if key == "SOURCE_DATE_EPOCH" {
+                    Some("1701234567".into())
+                } else {
+                    None
+                }
+            },
+            || {
+                now_called.set(true);
+                Ok(42)
+            },
+        )
+        .expect("resolve local build source date epoch");
+
+        assert!(!now_called.get());
+        assert_eq!(epoch, 1_701_234_567);
     }
 
     #[test]

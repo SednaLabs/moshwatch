@@ -582,6 +582,7 @@ mod tests {
             health: HealthState::Ok,
             started_at_unix_ms: 1_000,
             last_observed_unix_ms: 2_000,
+            counter_reset_unix_ms: None,
             bind_addr: Some("127.0.0.1".to_string()),
             udp_port: Some(60001),
             client_addr: Some("192.0.2.1:60001".to_string()),
@@ -651,7 +652,7 @@ mod tests {
                 schema_version: super::API_SCHEMA_VERSION,
                 observer: observer(),
                 generated_at_unix_ms: 2_000,
-                config: AppConfig::default(),
+                config: (&AppConfig::default()).into(),
             })
             .expect("encode config response"),
         ))
@@ -783,6 +784,7 @@ mod tests {
         let mut config = crate::config::AppConfig::default();
         config.metrics.prometheus.listen_addr = None;
         let payload = super::ApiConfigResponse {
+            schema_version: super::API_SCHEMA_VERSION,
             observer: crate::identity::ObserverInfo {
                 node_name: "node-1".to_string(),
                 system_id: "system-1".to_string(),

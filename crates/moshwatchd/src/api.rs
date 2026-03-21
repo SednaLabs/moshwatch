@@ -888,6 +888,7 @@ mod tests {
         config.metrics.otlp.enabled = true;
         config.metrics.otlp.endpoint = "http://127.0.0.1:4318/v1/metrics".to_string();
         let expected = serde_json::to_value(ApiConfigResponse {
+            schema_version: API_SCHEMA_VERSION,
             observer: observer(),
             generated_at_unix_ms: 0,
             config: ApiAppConfig::from(&config),
@@ -913,6 +914,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.metrics.prometheus.listen_addr = None;
         let expected = serde_json::to_value(ApiConfigResponse {
+            schema_version: API_SCHEMA_VERSION,
             observer: observer(),
             generated_at_unix_ms: 0,
             config: ApiAppConfig::from(&config),

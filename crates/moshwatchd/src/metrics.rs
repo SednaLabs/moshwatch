@@ -1532,7 +1532,6 @@ mod tests {
         assert!(!metrics.contains("udp_port="));
         assert!(!metrics.contains("client_addr="));
         assert!(!metrics.contains(",display_session_id=\"display\",kind=\"instrumented\"} 12.5"));
-        );
     }
 
     #[test]
