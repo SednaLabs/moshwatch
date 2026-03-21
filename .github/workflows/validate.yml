@@ -150,7 +150,7 @@ jobs:
           echo "tag=${release_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Create local release tag
-        run: git tag -f "${{ steps.release-tag.outputs.tag }}" HEAD
+        run: git -c tag.gpgSign=false -c tag.forceSignAnnotated=false tag -f "${{ steps.release-tag.outputs.tag }}" HEAD
 
       - name: Package release assets
         run: cargo run --locked -p xtask -- package-release --tag "${{ steps.release-tag.outputs.tag }}"
