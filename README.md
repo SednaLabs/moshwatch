@@ -496,7 +496,8 @@ OTLP/HTTP metrics to the configured collector endpoint. The default shape is:
 - default detail tier: `aggregate_only`
 - additional headers and resource attributes configured under `[metrics.otlp]`
 - `metrics.otlp.headers` must use valid HTTP header syntax; `accept` and `content-type` are reserved by the exporter and rejected if configured explicitly
-- built-in observer identity is included only for `per_session` OTLP; `aggregate_only` omits it unless you explicitly add your own attribution via `metrics.otlp.resource_attributes`
+- built-in observer identity is included only for `per_session` OTLP; `aggregate_only` omits it
+- `metrics.otlp.resource_attributes` are merged into the OTLP resource emitted by the daemon, but built-in OTLP keys are reserved and rejected during configuration validation
 
 Start from the shipped collector example:
 
@@ -601,7 +602,8 @@ Notes:
 - `warn_silence_ms` and `critical_silence_ms` apply to `last_heard_age_ms`, not
   to remote-state idleness
 - `metrics.otlp.resource_attributes` are merged into the OTLP resource emitted
-  by the daemon
+  by the daemon, but built-in OTLP keys are reserved and rejected during
+  configuration validation
 
 ## Daemon Flags
 

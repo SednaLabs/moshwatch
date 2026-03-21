@@ -1146,9 +1146,9 @@ fn encode_otlp_metrics(
     let mut resource_attributes = vec![
         string_attribute("service.name", "moshwatchd"),
         string_attribute("service.version", env!("CARGO_PKG_VERSION")),
-        string_attribute("service.instance.id", &observer.system_id),
     ];
     if config.metrics.otlp.detail_tier.includes_sessions() {
+        resource_attributes.push(string_attribute("service.instance.id", &observer.system_id));
         resource_attributes.push(string_attribute(
             "moshwatch.observer.node_name",
             &observer.node_name,
@@ -1159,6 +1159,10 @@ fn encode_otlp_metrics(
         ));
     }
     for (key, value) in &config.metrics.otlp.resource_attributes {
+        anyhow::ensure!(
+            !moshwatch_core::config::is_reserved_otlp_resource_attribute_key(key),
+            "metrics.otlp.resource_attributes cannot override reserved OTLP key {key}"
+        );
         resource_attributes.push(string_attribute(key, value));
     }
     let request = ExportMetricsServiceRequest {
@@ -1806,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_only_otlp_includes_stable_instance_identity() {
+    fn aggregate_only_otlp_omits_builtin_instance_identity() {
         let observer = ObserverInfo {
             node_name: "node-1".to_string(),
             system_id: "system-1".to_string(),
@@ -1847,18 +1851,6 @@ mod tests {
                 .any(|attr| attr.key == "service.version")
         );
         assert!(
-            resource_attributes
-                .iter()
-                .any(|attr| attr.key == "service.instance.id")
-        );
-        assert!(resource_attributes.iter().any(|attr| {
-            attr.key == "service.instance.id"
-                && matches!(
-                    attr.value.as_ref().and_then(|value| value.value.as_ref()),
-                    Some(Value::StringValue(value)) if value == "system-1"
-                )
-        }));
-        assert!(
             !resource_attributes
                 .iter()
                 .any(|attr| attr.key == "moshwatch.observer.node_name")
@@ -1868,5 +1860,100 @@ mod tests {
                 .iter()
                 .any(|attr| attr.key == "moshwatch.observer.system_id")
         );
+        assert!(
+            !resource_attributes
+                .iter()
+                .any(|attr| attr.key == "service.instance.id")
+        );
+    }
+
+    #[test]
+    fn otlp_session_export_includes_builtin_instance_identity() {
+        let observer = ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        };
+        let mut config = AppConfig::default();
+        config.metrics.otlp.detail_tier = MetricsDetailTier::PerSession;
+        let export = sample_export();
+        let samples = collect_metric_samples(
+            &config,
+            &observer,
+            &export,
+            None,
+            sample_runtime(),
+            &OtlpExporterStatsSnapshot::default(),
+            MetricCollectionOptions {
+                detail_tier: config.metrics.otlp.detail_tier,
+                include_observer_info: true,
+            },
+        );
+        let payload = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
+            .expect("encode OTLP metrics");
+        let request = ExportMetricsServiceRequest::decode(payload.as_slice())
+            .expect("decode OTLP metrics payload");
+        let resource_attributes = &request.resource_metrics[0]
+            .resource
+            .as_ref()
+            .expect("resource")
+            .attributes;
+
+        assert!(resource_attributes.iter().any(|attr| {
+            attr.key == "service.instance.id"
+                && matches!(
+                    attr.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(Value::StringValue(value)) if value == "system-1"
+                )
+        }));
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.node_name")
+        );
+        assert!(
+            resource_attributes
+                .iter()
+                .any(|attr| attr.key == "moshwatch.observer.system_id")
+        );
+    }
+
+    #[test]
+    fn otlp_resource_attributes_reject_reserved_keys() {
+        let observer = ObserverInfo {
+            node_name: "node-1".to_string(),
+            system_id: "system-1".to_string(),
+        };
+        let export = sample_export();
+        let samples = collect_metric_samples(
+            &AppConfig::default(),
+            &observer,
+            &export,
+            None,
+            sample_runtime(),
+            &OtlpExporterStatsSnapshot::default(),
+            MetricCollectionOptions {
+                detail_tier: MetricsDetailTier::AggregateOnly,
+                include_observer_info: false,
+            },
+        );
+
+        for reserved_key in [
+            "service.name",
+            "service.version",
+            "service.instance.id",
+            "moshwatch.observer.node_name",
+            "moshwatch.observer.system_id",
+        ] {
+            let mut config = AppConfig::default();
+            config.metrics.otlp.resource_attributes =
+                std::collections::BTreeMap::from([(reserved_key.to_string(), "value".to_string())]);
+
+            let err = encode_otlp_metrics(&observer, &config, &samples, 10_000, unix_nanos(9_000))
+                .expect_err("reserved OTLP resource key should be rejected");
+            assert!(
+                err.to_string().contains(reserved_key),
+                "error should mention reserved key {reserved_key}: {err}"
+            );
+        }
     }
 }

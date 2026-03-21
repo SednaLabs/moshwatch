@@ -372,6 +372,11 @@ impl AppConfig {
             if name.trim().is_empty() {
                 anyhow::bail!("metrics.otlp.resource_attributes cannot contain an empty key");
             }
+            if is_reserved_otlp_resource_attribute_key(name) {
+                anyhow::bail!(
+                    "metrics.otlp.resource_attributes cannot override reserved OTLP key {name}"
+                );
+            }
         }
         if self.cleanup_interval_ms < self.discovery_interval_ms {
             anyhow::bail!(
@@ -396,6 +401,20 @@ fn validate_otlp_header(name: &str, value: &str) -> Result<()> {
         format!("metrics.otlp.headers contains invalid HTTP header value for {name:?}")
     })?;
     Ok(())
+}
+
+const OTLP_RESOURCE_ATTRIBUTE_RESERVED_KEYS: &[&str] = &[
+    "service.name",
+    "service.version",
+    "service.instance.id",
+    "moshwatch.observer.node_name",
+    "moshwatch.observer.system_id",
+];
+
+pub fn is_reserved_otlp_resource_attribute_key(key: &str) -> bool {
+    OTLP_RESOURCE_ATTRIBUTE_RESERVED_KEYS
+        .iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved))
 }
 
 #[derive(Debug, Clone)]
@@ -1192,6 +1211,37 @@ accept = "text/plain"
             ..AppConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_validation_rejects_reserved_otlp_resource_attributes() {
+        for reserved_key in [
+            "service.name",
+            "service.version",
+            "service.instance.id",
+            "moshwatch.observer.node_name",
+            "moshwatch.observer.system_id",
+        ] {
+            let config: AppConfig = toml::from_str(&format!(
+                r#"
+[metrics.otlp]
+enabled = true
+endpoint = "http://127.0.0.1:4318/v1/metrics"
+
+[metrics.otlp.resource_attributes]
+"{reserved_key}" = "value"
+"#
+            ))
+            .expect("parse config with reserved OTLP resource key");
+
+            let err = config
+                .validate()
+                .expect_err("reserved OTLP resource key should be rejected");
+            assert!(
+                err.to_string().contains(reserved_key),
+                "error should mention reserved key {reserved_key}: {err}"
+            );
+        }
     }
 
     #[test]
