@@ -8,7 +8,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+flate2 = "1"
 moshwatch-core = { path = "../crates/moshwatch-core" }
+sha2.workspace = true
+tar = "0.4"
 serde_json.workspace = true
 tempfile.workspace = true
 toml.workspace = true

@@ -7,31 +7,63 @@
 //! wiring the wrapper, and installing the user service.
 
 use std::{
-    env, fs,
-    io::{self, Write},
+    collections::BTreeMap,
+    env,
+    ffi::OsString,
+    fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result};
+use flate2::{Compression, write::GzEncoder};
 use moshwatch_core::{
     AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy, MetricsDetailTier,
     metric_catalog,
 };
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
+use sha2::{Digest, Sha256};
+use tar::Builder as TarBuilder;
 use tempfile::NamedTempFile;
 
 const PATH_BLOCK_START: &str = "# >>> moshwatch path >>>";
 const PATH_BLOCK_END: &str = "# <<< moshwatch path <<<";
+const VENDOR_CONFIGURE_ARGS: &[&str] = &[
+    "--enable-server",
+    "--disable-client",
+    "--disable-examples",
+    "--enable-compile-warnings=no",
+];
+const VENDOR_BUILD_PINNED_ENV: &[(&str, &str)] = &[
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+    ("TZ", "UTC"),
+    ("ZERO_AR_DATE", "1"),
+];
+const VENDOR_BUILD_DEFAULT_TOOLS: &[(&str, &str)] = &[
+    ("CC", "cc"),
+    ("CXX", "c++"),
+    ("AR", "ar"),
+    ("RANLIB", "ranlib"),
+    ("PKG_CONFIG", "pkg-config"),
+    ("PROTOC", "protoc"),
+];
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".to_string());
     match command.as_str() {
-        "build" => build_all(),
+        "build" => {
+            let root = repo_root()?;
+            let source_metadata = resolve_source_metadata(&root, "HEAD")?;
+            build_all(&root, source_metadata.source_date_epoch)
+        }
         "install" => {
-            build_all()?;
+            let root = repo_root()?;
+            let source_metadata = resolve_source_metadata(&root, "HEAD")?;
+            build_all(&root, source_metadata.source_date_epoch)?;
             install_artifacts()?;
             install_wrapper()?;
             install_shell_integration()?;
@@ -45,16 +77,62 @@ fn main() -> Result<()> {
         }
         "install-service" => install_service(),
         "install-shell-integration" => install_shell_integration(),
+        "package-release" => package_release(parse_package_release_tag(args)?),
         "sync-observability-docs" => sync_observability_docs(false),
         "check-observability-docs" => sync_observability_docs(true),
         "validate-observability-assets" => validate_observability_assets(),
         _ => {
             eprintln!(
-                "usage: cargo run -p xtask -- <build|install|install-artifacts|install-wrapper|install-service|install-shell-integration|sync-observability-docs|check-observability-docs|validate-observability-assets>"
+                "usage: cargo run -p xtask -- <build|install|install-artifacts|install-wrapper|install-service|install-shell-integration|package-release [--tag <tag>]|sync-observability-docs|check-observability-docs|validate-observability-assets>"
             );
             Ok(())
         }
     }
+}
+
+fn parse_package_release_tag(mut args: impl Iterator<Item = String>) -> Result<String> {
+    let mut tag = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tag" => {
+                let value = args.next().context("--tag requires a release tag value")?;
+                tag = Some(value);
+            }
+            value if value.starts_with("--tag=") => {
+                tag = Some(value.trim_start_matches("--tag=").to_string());
+            }
+            "-h" | "--help" => {
+                anyhow::bail!("usage: cargo run -p xtask -- package-release [--tag <tag>]");
+            }
+            unexpected => anyhow::bail!("unexpected argument {unexpected}"),
+        }
+    }
+    Ok(tag.unwrap_or_else(expected_release_tag))
+}
+
+fn expected_release_tag() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+#[derive(Debug, Clone)]
+struct SourceMetadata {
+    source_ref: String,
+    source_commit: String,
+    source_commit_unix_ts: u64,
+    source_date_epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MoshServerBuildInfo {
+    release_tag: String,
+    source_ref: String,
+    source_commit: String,
+    source_commit_unix_ts: u64,
+    source_date_epoch: u64,
+    configure_args: Vec<String>,
+    packaged_binary_sha256: String,
+    build_environment: BTreeMap<String, String>,
+    tool_versions: BTreeMap<String, String>,
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -72,26 +150,39 @@ fn install_bin_dir() -> Result<PathBuf> {
     Ok(install_root()?.join("bin"))
 }
 
-fn build_all() -> Result<()> {
+fn build_all(root: &Path, source_date_epoch: u64) -> Result<()> {
     // Keep `dist/bin` as the repo-local handoff point. Both local development
     // and `xtask install` consume the same built artifacts from there.
-    let root = repo_root()?;
     let dist_bin = root.join("dist/bin");
     let vendor_source = root.join("vendor/mosh");
     let vendor_build = root.join("build/vendor-mosh");
+    let vendor_build_env = vendored_build_environment(source_date_epoch);
     fs::create_dir_all(&dist_bin).context("create dist/bin")?;
     fs::create_dir_all(&vendor_build).context("create vendor build dir")?;
 
     if !vendor_source.join("configure").exists() {
-        run(Command::new("bash")
-            .arg("autogen.sh")
-            .current_dir(&vendor_source))?;
+        run_vendored_command(
+            Command::new("bash")
+                .arg("autogen.sh")
+                .current_dir(&vendor_source),
+            &vendor_build_env,
+            source_date_epoch,
+        )?;
     }
 
-    configure_vendor_build(&vendor_source, &vendor_build)?;
-    run(Command::new("make")
-        .arg(format!("-j{}", available_parallelism()))
-        .current_dir(&vendor_build))?;
+    configure_vendor_build(
+        &vendor_source,
+        &vendor_build,
+        &vendor_build_env,
+        source_date_epoch,
+    )?;
+    run_vendored_command(
+        Command::new("make")
+            .arg(format!("-j{}", available_parallelism()))
+            .current_dir(&vendor_build),
+        &vendor_build_env,
+        source_date_epoch,
+    )?;
 
     install_binary(
         &vendor_build.join("src/frontend/mosh-server"),
@@ -99,15 +190,19 @@ fn build_all() -> Result<()> {
     )
     .context("copy instrumented mosh-server")?;
 
-    run(Command::new("cargo")
-        .arg("build")
-        .arg("--locked")
-        .arg("--release")
-        .arg("-p")
-        .arg("moshwatchd")
-        .arg("-p")
-        .arg("moshwatch-ui")
-        .current_dir(&root))?;
+    run_vendored_command(
+        Command::new("cargo")
+            .arg("build")
+            .arg("--locked")
+            .arg("--release")
+            .arg("-p")
+            .arg("moshwatchd")
+            .arg("-p")
+            .arg("moshwatch-ui")
+            .current_dir(root),
+        &vendor_build_env,
+        source_date_epoch,
+    )?;
 
     install_binary(
         &root.join("target/release/moshwatchd"),
@@ -122,14 +217,512 @@ fn build_all() -> Result<()> {
     Ok(())
 }
 
-fn configure_vendor_build(vendor_source: &Path, vendor_build: &Path) -> Result<()> {
+fn package_release(tag: String) -> Result<()> {
+    ensure_release_platform()?;
+    let expected_tag = expected_release_tag();
+    anyhow::ensure!(
+        tag == expected_tag,
+        "release tag {tag} does not match workspace version tag {expected_tag}"
+    );
+
+    let root = repo_root()?;
+    let source_ref = resolve_release_source_ref(&root, &tag)?;
+    let source_metadata = resolve_source_metadata(&root, &source_ref)?;
+    let vendor_build_env = vendored_build_environment(source_metadata.source_date_epoch);
+    let artifact_paths = release_artifact_paths(&root, &tag);
+
+    build_all(&root, source_metadata.source_date_epoch)?;
+    stage_release_tree(&root, &artifact_paths.stage_dir)?;
+    validate_release_tree(&artifact_paths.stage_dir)?;
+    write_mosh_server_build_info(
+        &artifact_paths.build_info_json,
+        &MoshServerBuildInfo {
+            release_tag: tag.clone(),
+            source_ref: source_metadata.source_ref.clone(),
+            source_commit: source_metadata.source_commit.clone(),
+            source_commit_unix_ts: source_metadata.source_commit_unix_ts,
+            source_date_epoch: source_metadata.source_date_epoch,
+            configure_args: VENDOR_CONFIGURE_ARGS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            packaged_binary_sha256: sha256_hex(
+                &artifact_paths.stage_dir.join("bin/mosh-server-real"),
+            )?,
+            build_environment: vendor_build_env.clone(),
+            tool_versions: collect_tool_versions(&vendor_build_env)?,
+        },
+    )?;
+    write_binary_archive(&artifact_paths.stage_dir, &artifact_paths.binary_tarball)?;
+    write_source_archive(&root, &tag, &source_ref, &artifact_paths.source_tarball)?;
+    write_sha256_sums(
+        &artifact_paths.sha256_sums,
+        &[
+            &artifact_paths.binary_tarball,
+            &artifact_paths.source_tarball,
+        ],
+    )?;
+
+    eprintln!(
+        "staged {} and wrote {}",
+        artifact_paths.stage_dir.display(),
+        artifact_paths.release_dir.display()
+    );
+    Ok(())
+}
+
+fn ensure_release_platform() -> Result<()> {
+    anyhow::ensure!(
+        cfg!(target_os = "linux") && cfg!(target_arch = "x86_64"),
+        "package-release is only supported on Linux x86_64"
+    );
+    Ok(())
+}
+
+fn resolve_source_metadata(root: &Path, source_ref: &str) -> Result<SourceMetadata> {
+    let source_commit = capture_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg(format!("{source_ref}^{{commit}}")),
+    )?;
+    let source_commit_unix_ts = capture_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("show")
+            .arg("-s")
+            .arg("--format=%ct")
+            .arg(source_commit.trim()),
+    )?
+    .trim()
+    .parse::<u64>()
+    .with_context(|| format!("parse commit timestamp for {source_ref}"))?;
+
+    Ok(SourceMetadata {
+        source_ref: source_ref.to_string(),
+        source_commit: source_commit.trim().to_string(),
+        source_commit_unix_ts,
+        source_date_epoch: source_commit_unix_ts,
+    })
+}
+
+fn resolve_release_source_ref(root: &Path, tag: &str) -> Result<String> {
+    let tracked_changes = capture_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("status")
+            .arg("--porcelain")
+            .arg("--untracked-files=no"),
+    )?;
+    anyhow::ensure!(
+        tracked_changes.trim().is_empty(),
+        "refusing to package a release with tracked worktree changes"
+    );
+
+    let head = capture_stdout(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("rev-parse")
+            .arg("HEAD"),
+    )?;
+    let Some(tag_commit) = resolve_git_commit(root, &format!("{tag}^{{commit}}"))? else {
+        return Ok("HEAD".to_string());
+    };
+    anyhow::ensure!(
+        head.trim() == tag_commit.trim(),
+        "release tag {tag} must point at HEAD before packaging"
+    );
+    Ok(tag.to_string())
+}
+
+struct ReleaseArtifactPaths {
+    release_dir: PathBuf,
+    stage_dir: PathBuf,
+    binary_tarball: PathBuf,
+    source_tarball: PathBuf,
+    sha256_sums: PathBuf,
+    build_info_json: PathBuf,
+}
+
+fn release_artifact_paths(root: &Path, tag: &str) -> ReleaseArtifactPaths {
+    let release_dir = root.join("dist/release");
+    let stage_dir = release_dir.join(format!("moshwatch-{tag}-linux-x86_64"));
+    ReleaseArtifactPaths {
+        release_dir: release_dir.clone(),
+        stage_dir: stage_dir.clone(),
+        binary_tarball: release_dir.join(format!("moshwatch-{tag}-linux-x86_64.tar.gz")),
+        source_tarball: release_dir.join(format!("moshwatch-{tag}-source.tar.gz")),
+        sha256_sums: release_dir.join("SHA256SUMS"),
+        build_info_json: release_dir
+            .join(format!("moshwatch-{tag}-mosh-server-real-build-info.json")),
+    }
+}
+
+fn stage_release_tree(root: &Path, stage_dir: &Path) -> Result<()> {
+    if stage_dir.exists() {
+        fs::remove_dir_all(stage_dir)
+            .with_context(|| format!("clear release stage {}", stage_dir.display()))?;
+    }
+    fs::create_dir_all(stage_dir)
+        .with_context(|| format!("create release stage {}", stage_dir.display()))?;
+
+    let dist_bin = root.join("dist/bin");
+    let stage_bin = stage_dir.join("bin");
+    let stage_templates = stage_dir.join("templates");
+    let stage_licenses = stage_dir.join("licenses");
+    let stage_vendor_licenses = stage_licenses.join("vendor-mosh");
+    fs::create_dir_all(&stage_bin).with_context(|| format!("create {}", stage_bin.display()))?;
+    fs::create_dir_all(&stage_templates)
+        .with_context(|| format!("create {}", stage_templates.display()))?;
+    fs::create_dir_all(&stage_vendor_licenses)
+        .with_context(|| format!("create {}", stage_vendor_licenses.display()))?;
+
+    for binary in ["mosh-server-real", "moshwatchd", "moshwatch"] {
+        install_binary(&dist_bin.join(binary), &stage_bin.join(binary))
+            .with_context(|| format!("stage binary {binary}"))?;
+    }
+
+    install_text_file(
+        &stage_dir.join("install.sh"),
+        &render_release_install_script(),
+        0o755,
+    )
+    .context("stage release installer")?;
+
+    for (source, destination) in [
+        (
+            root.join("scripts/mosh-server-wrapper.sh"),
+            stage_templates.join("mosh-server-wrapper.sh"),
+        ),
+        (
+            root.join("systemd/moshwatchd.service.template"),
+            stage_templates.join("moshwatchd.service"),
+        ),
+        (root.join("README.md"), stage_dir.join("README.md")),
+        (root.join("LICENSE"), stage_dir.join("LICENSE")),
+        (root.join("NOTICE"), stage_dir.join("NOTICE")),
+        (root.join("LICENSES.md"), stage_dir.join("LICENSES.md")),
+        (
+            root.join("vendor/mosh/AUTHORS"),
+            stage_vendor_licenses.join("AUTHORS"),
+        ),
+        (
+            root.join("vendor/mosh/COPYING"),
+            stage_vendor_licenses.join("COPYING"),
+        ),
+        (
+            root.join("vendor/mosh/COPYING.iOS"),
+            stage_vendor_licenses.join("COPYING.iOS"),
+        ),
+        (
+            root.join("vendor/mosh/README.md"),
+            stage_vendor_licenses.join("README.md"),
+        ),
+    ] {
+        install_text_file(
+            &destination,
+            &fs::read_to_string(&source).with_context(|| format!("read {}", source.display()))?,
+            0o644,
+        )
+        .with_context(|| format!("stage {}", destination.display()))?;
+    }
+
+    Ok(())
+}
+
+fn validate_release_tree(stage_dir: &Path) -> Result<()> {
+    for relative in [
+        "bin/mosh-server-real",
+        "bin/moshwatchd",
+        "bin/moshwatch",
+        "install.sh",
+        "README.md",
+        "LICENSE",
+        "NOTICE",
+        "LICENSES.md",
+        "templates/mosh-server-wrapper.sh",
+        "templates/moshwatchd.service",
+        "licenses/vendor-mosh/AUTHORS",
+        "licenses/vendor-mosh/COPYING",
+        "licenses/vendor-mosh/COPYING.iOS",
+        "licenses/vendor-mosh/README.md",
+    ] {
+        let path = stage_dir.join(relative);
+        anyhow::ensure!(path.exists(), "missing release file {}", path.display());
+    }
+
+    let install_mode = file_mode_or_default(&stage_dir.join("install.sh"), 0);
+    anyhow::ensure!(
+        install_mode & 0o111 != 0,
+        "release installer is not executable"
+    );
+
+    Ok(())
+}
+
+fn write_mosh_server_build_info(destination: &Path, info: &MoshServerBuildInfo) -> Result<()> {
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "release_tag": &info.release_tag,
+        "source": {
+            "ref": &info.source_ref,
+            "commit": &info.source_commit,
+            "commit_unix_ts": info.source_commit_unix_ts,
+            "source_date_epoch": info.source_date_epoch,
+        },
+        "configure": {
+            "args": &info.configure_args,
+            "environment": &info.build_environment,
+        },
+        "packaged_binary_sha256": &info.packaged_binary_sha256,
+        "tool_versions": &info.tool_versions,
+    }))
+    .context("serialize mosh-server-real build info")?;
+    install_text_file(destination, &(body + "\n"), 0o644)
+}
+
+fn render_release_install_script() -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+set -euo pipefail
+
+PATH_BLOCK_START='{path_block_start}'
+PATH_BLOCK_END='{path_block_end}'
+
+RELEASE_ROOT="$(CDPATH= cd -- "$(dirname -- "${{BASH_SOURCE[0]}}")" && pwd)"
+INSTALL_BIN_DIR="$HOME/.local/share/moshwatch/bin"
+USER_BIN_DIR="$HOME/.local/bin"
+CONFIG_DIR="$HOME/.config/moshwatch"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+
+mkdir -p "$INSTALL_BIN_DIR" "$USER_BIN_DIR" "$CONFIG_DIR" "$SYSTEMD_DIR"
+
+install -m 0755 "$RELEASE_ROOT/bin/mosh-server-real" "$INSTALL_BIN_DIR/mosh-server-real"
+install -m 0755 "$RELEASE_ROOT/bin/moshwatchd" "$INSTALL_BIN_DIR/moshwatchd"
+install -m 0755 "$RELEASE_ROOT/bin/moshwatch" "$INSTALL_BIN_DIR/moshwatch"
+install -m 0755 "$RELEASE_ROOT/bin/moshwatch" "$USER_BIN_DIR/moshwatch"
+
+render_template() {{
+    local source_file="$1"
+    local destination_file="$2"
+    sed "s#@INSTALL_BIN_DIR@#${{INSTALL_BIN_DIR}}#g" "$source_file" > "$destination_file"
+}}
+
+render_template "$RELEASE_ROOT/templates/mosh-server-wrapper.sh" "$USER_BIN_DIR/mosh-server"
+chmod 0755 "$USER_BIN_DIR/mosh-server"
+
+render_template "$RELEASE_ROOT/templates/moshwatchd.service" "$SYSTEMD_DIR/moshwatchd.service"
+chmod 0644 "$SYSTEMD_DIR/moshwatchd.service"
+
+cat > "$CONFIG_DIR/path.sh" <<'EOF'
+# Added by moshwatch install. Keep ~/.local/bin ahead of system PATH so SSH-launched Mosh sessions resolve the wrapper.
+if [ -d "$HOME/.local/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) PATH="$HOME/.local/bin:$PATH" ;;
+    esac
+fi
+EOF
+
+upsert_managed_block() {{
+    local file_path="$1"
+    local placement="$2"
+    local tmp_file
+    tmp_file="$(mktemp "$(dirname -- "$file_path")/.${{file_path##*/}}.XXXXXX")"
+
+    if [[ -f "$file_path" ]]; then
+        awk -v start="$PATH_BLOCK_START" -v end="$PATH_BLOCK_END" '
+            BEGIN {{ skipping = 0 }}
+            $0 == start {{ skipping = 1; next }}
+            skipping && $0 == end {{ skipping = 0; next }}
+            !skipping {{ print }}
+        ' "$file_path" > "$tmp_file"
+    else
+        : > "$tmp_file"
+    fi
+
+    if [[ "$placement" == "prepend" ]]; then
+        if [[ -s "$tmp_file" ]]; then
+            {{
+                printf '%s\n' "$PATH_BLOCK_START"
+                printf '[ -r "$HOME/.config/moshwatch/path.sh" ] && . "$HOME/.config/moshwatch/path.sh"\n'
+                printf '%s\n' "$PATH_BLOCK_END"
+                printf '\n'
+                cat "$tmp_file"
+            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+        else
+            {{
+                printf '%s\n' "$PATH_BLOCK_START"
+                printf '[ -r "$HOME/.config/moshwatch/path.sh" ] && . "$HOME/.config/moshwatch/path.sh"\n'
+                printf '%s\n' "$PATH_BLOCK_END"
+            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+        fi
+    else
+        if [[ -s "$tmp_file" ]]; then
+            {{
+                cat "$tmp_file"
+                printf '\n'
+                printf '%s\n' "$PATH_BLOCK_START"
+                printf '[ -r "$HOME/.config/moshwatch/path.sh" ] && . "$HOME/.config/moshwatch/path.sh"\n'
+                printf '%s\n' "$PATH_BLOCK_END"
+            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+        else
+            {{
+                printf '%s\n' "$PATH_BLOCK_START"
+                printf '[ -r "$HOME/.config/moshwatch/path.sh" ] && . "$HOME/.config/moshwatch/path.sh"\n'
+                printf '%s\n' "$PATH_BLOCK_END"
+            }} > "$(dirname -- "$file_path")/.${{file_path##*/}}.next"
+        fi
+    fi
+
+    mv "$(dirname -- "$file_path")/.${{file_path##*/}}.next" "$file_path"
+    rm -f "$tmp_file"
+}}
+
+upsert_managed_block "$HOME/.bashrc" prepend
+upsert_managed_block "$HOME/.profile" append
+
+systemctl --user daemon-reload
+systemctl --user enable moshwatchd.service
+systemctl --user restart moshwatchd.service
+"#,
+        path_block_start = PATH_BLOCK_START,
+        path_block_end = PATH_BLOCK_END
+    )
+}
+
+fn write_binary_archive(stage_dir: &Path, destination: &Path) -> Result<()> {
+    let stage_name = stage_dir
+        .file_name()
+        .context("determine release stage directory name")?
+        .to_string_lossy()
+        .to_string();
+    write_tar_gz(destination, |tar| {
+        tar.append_dir_all(&stage_name, stage_dir)
+            .with_context(|| format!("append release tree {}", stage_dir.display()))
+    })
+}
+
+fn write_source_archive(
+    root: &Path,
+    tag: &str,
+    source_ref: &str,
+    destination: &Path,
+) -> Result<()> {
+    let archive = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("archive")
+        .arg("--format=tar.gz")
+        .arg(format!("--prefix=moshwatch-{tag}-source/"))
+        .arg(source_ref)
+        .output()
+        .with_context(|| format!("archive release source {source_ref} in {}", root.display()))?;
+    anyhow::ensure!(
+        archive.status.success(),
+        "git archive failed with status {}",
+        archive.status
+    );
+    install_bytes(destination, &archive.stdout, 0o644)
+}
+
+fn write_tar_gz<F>(destination: &Path, mut write_archive: F) -> Result<()>
+where
+    F: FnMut(&mut TarBuilder<GzEncoder<&mut fs::File>>) -> Result<()>,
+{
+    install_file_with_temporary(destination, 0o644, |temporary| {
+        let temporary_path = temporary.path().to_path_buf();
+        let file = temporary.as_file_mut();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut tar = TarBuilder::new(encoder);
+        write_archive(&mut tar)?;
+        let encoder = tar
+            .into_inner()
+            .with_context(|| format!("finalize tar archive {}", temporary_path.display()))?;
+        let file = encoder
+            .finish()
+            .with_context(|| format!("finish gzip archive {}", temporary_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", temporary_path.display()))
+    })
+}
+
+fn write_sha256_sums(destination: &Path, files: &[&Path]) -> Result<()> {
+    let mut body = String::new();
+    for file in files {
+        let digest = sha256_hex(file)?;
+        let name = file
+            .file_name()
+            .context("determine checksum file name")?
+            .to_string_lossy();
+        body.push_str(&format!("{digest}  {name}\n"));
+    }
+    install_text_file(destination, &body, 0o644)
+}
+
+fn sha256_hex(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("hash {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn resolve_git_commit(root: &Path, revision: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("-q")
+        .arg(revision)
+        .output()
+        .with_context(|| format!("resolve git revision {revision} in {}", root.display()))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map(Some)
+            .context("decode git revision stdout as UTF-8");
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "git rev-parse {revision} failed with status {}",
+        output.status
+    );
+}
+
+fn configure_vendor_build(
+    vendor_source: &Path,
+    vendor_build: &Path,
+    build_environment: &BTreeMap<String, String>,
+    source_date_epoch: u64,
+) -> Result<()> {
     let configure = || {
-        run(Command::new(vendor_source.join("configure"))
-            .arg("--enable-server")
-            .arg("--disable-client")
-            .arg("--disable-examples")
-            .arg("--enable-compile-warnings=no")
-            .current_dir(vendor_build))
+        run_vendored_command(
+            Command::new(vendor_source.join("configure"))
+                .arg("--enable-server")
+                .arg("--disable-client")
+                .arg("--disable-examples")
+                .arg("--enable-compile-warnings=no")
+                .current_dir(vendor_build),
+            build_environment,
+            source_date_epoch,
+        )
     };
 
     match configure() {
@@ -146,6 +739,113 @@ fn configure_vendor_build(vendor_source: &Path, vendor_build: &Path) -> Result<(
             Ok(())
         }
     }
+}
+
+fn vendored_build_environment(source_date_epoch: u64) -> BTreeMap<String, String> {
+    vendored_build_environment_from(source_date_epoch, |key| env::var_os(key))
+}
+
+fn vendored_build_environment_from<F>(
+    source_date_epoch: u64,
+    mut lookup: F,
+) -> BTreeMap<String, String>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    let mut environment = BTreeMap::new();
+    for (key, value) in VENDOR_BUILD_PINNED_ENV {
+        environment.insert(key.to_string(), (*value).to_string());
+    }
+    for (key, default) in VENDOR_BUILD_DEFAULT_TOOLS {
+        let value = lookup(key).unwrap_or_else(|| OsString::from(default));
+        environment.insert(key.to_string(), value.to_string_lossy().to_string());
+    }
+    for key in ["CFLAGS", "CXXFLAGS", "LDFLAGS"] {
+        if let Some(value) = lookup(key) {
+            environment.insert(key.to_string(), value.to_string_lossy().to_string());
+        }
+    }
+    if let Some(value) = lookup("ARFLAGS") {
+        environment.insert("ARFLAGS".to_string(), value.to_string_lossy().to_string());
+    }
+    environment.insert(
+        "SOURCE_DATE_EPOCH".to_string(),
+        source_date_epoch.to_string(),
+    );
+    environment
+}
+
+fn collect_tool_versions(
+    build_environment: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut tool_versions = BTreeMap::new();
+    for tool in ["autoconf", "automake", "make", "rustc", "cargo"] {
+        tool_versions.insert(
+            tool.to_string(),
+            capture_tool_version(tool, &["--version"])?,
+        );
+    }
+
+    for (logical_key, env_key, default) in [
+        ("cc", "CC", "cc"),
+        ("cxx", "CXX", "c++"),
+        ("ar", "AR", "ar"),
+        ("ranlib", "RANLIB", "ranlib"),
+        ("pkg-config", "PKG_CONFIG", "pkg-config"),
+        ("protoc", "PROTOC", "protoc"),
+    ] {
+        let tool = tool_command_from_environment(build_environment, env_key, default);
+        tool_versions.insert(
+            logical_key.to_string(),
+            capture_tool_version(&tool, &["--version"])?,
+        );
+    }
+
+    Ok(tool_versions)
+}
+
+fn capture_tool_version(command: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(command)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn {command}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "command {command:?} failed with status {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).context("decode tool version stdout as UTF-8")?;
+    Ok(stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string())
+}
+
+fn tool_command_from_environment(
+    build_environment: &BTreeMap<String, String>,
+    key: &str,
+    default: &str,
+) -> String {
+    build_environment
+        .get(key)
+        .and_then(|value| value.split_whitespace().next())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn run_vendored_command(
+    command: &mut Command,
+    build_environment: &BTreeMap<String, String>,
+    source_date_epoch: u64,
+) -> Result<()> {
+    for (key, value) in build_environment {
+        command.env(key, value);
+    }
+    command.env("SOURCE_DATE_EPOCH", source_date_epoch.to_string());
+    run(command)
 }
 
 fn install_artifacts() -> Result<()> {
@@ -301,6 +1001,27 @@ fn install_text_file(destination: &Path, contents: &str, mode: u32) -> Result<()
         file.flush()
             .with_context(|| format!("flush {}", temporary_path.display()))
     })
+}
+
+fn install_bytes(destination: &Path, contents: &[u8], mode: u32) -> Result<()> {
+    install_file_with_temporary(destination, mode, |temporary| {
+        let temporary_path = temporary.path().to_path_buf();
+        let file = temporary.as_file_mut();
+        file.write_all(contents)
+            .with_context(|| format!("write {}", temporary_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", temporary_path.display()))
+    })
+}
+
+fn capture_stdout(command: &mut Command) -> Result<String> {
+    let output = command
+        .output()
+        .with_context(|| format!("spawn {:?}", command))?;
+    if !output.status.success() {
+        anyhow::bail!("command {:?} failed with status {}", command, output.status);
+    }
+    String::from_utf8(output.stdout).context("decode command stdout as UTF-8")
 }
 
 fn upsert_managed_block(path: &Path, block: &str, placement: Placement) -> Result<()> {
@@ -661,13 +1382,17 @@ mod tests {
     use std::{
         fs,
         os::unix::{fs::PermissionsExt, fs::symlink},
+        path::Path,
     };
 
     use tempfile::tempdir;
 
     use super::{
-        PATH_BLOCK_END, PATH_BLOCK_START, Placement, install_binary, install_text_file,
-        render_template, strip_managed_block, upsert_managed_block,
+        MoshServerBuildInfo, PATH_BLOCK_END, PATH_BLOCK_START, Placement, install_binary,
+        install_text_file, release_artifact_paths, render_release_install_script, render_template,
+        sha256_hex, stage_release_tree, strip_managed_block, tool_command_from_environment,
+        upsert_managed_block, validate_release_tree, vendored_build_environment_from,
+        write_mosh_server_build_info, write_sha256_sums,
     };
 
     #[test]
@@ -745,5 +1470,269 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn release_artifact_paths_follow_expected_layout() {
+        let root = Path::new("/tmp/moshwatch");
+        let paths = release_artifact_paths(root, "v1.2.3");
+
+        assert_eq!(paths.release_dir, root.join("dist/release"));
+        assert_eq!(
+            paths.stage_dir,
+            root.join("dist/release/moshwatch-v1.2.3-linux-x86_64")
+        );
+        assert_eq!(
+            paths.binary_tarball,
+            root.join("dist/release/moshwatch-v1.2.3-linux-x86_64.tar.gz")
+        );
+        assert_eq!(
+            paths.source_tarball,
+            root.join("dist/release/moshwatch-v1.2.3-source.tar.gz")
+        );
+        assert_eq!(paths.sha256_sums, root.join("dist/release/SHA256SUMS"));
+        assert_eq!(
+            paths.build_info_json,
+            root.join("dist/release/moshwatch-v1.2.3-mosh-server-real-build-info.json")
+        );
+    }
+
+    #[test]
+    fn vendored_build_environment_pins_reproducibility_and_preserves_tool_overrides() {
+        let environment = vendored_build_environment_from(1_701_234_567, |key| match key {
+            "CXX" => Some("clang++".into()),
+            "CFLAGS" => Some("-O2".into()),
+            "ARFLAGS" => Some("crs".into()),
+            "TZ" => Some("Australia/Melbourne".into()),
+            _ => None,
+        });
+
+        assert_eq!(environment["LANG"], "C");
+        assert_eq!(environment["LC_ALL"], "C");
+        assert_eq!(environment["TZ"], "UTC");
+        assert_eq!(environment["ZERO_AR_DATE"], "1");
+        assert_eq!(environment["CC"], "cc");
+        assert_eq!(environment["CXX"], "clang++");
+        assert_eq!(environment["AR"], "ar");
+        assert_eq!(environment["RANLIB"], "ranlib");
+        assert_eq!(environment["PKG_CONFIG"], "pkg-config");
+        assert_eq!(environment["PROTOC"], "protoc");
+        assert_eq!(environment["CFLAGS"], "-O2");
+        assert_eq!(environment["ARFLAGS"], "crs");
+        assert_eq!(environment["SOURCE_DATE_EPOCH"], "1701234567");
+    }
+
+    #[test]
+    fn tool_command_from_environment_uses_effective_command_name() {
+        let mut environment = std::collections::BTreeMap::new();
+        environment.insert("CC".to_string(), "/usr/bin/clang".to_string());
+        environment.insert("CXX".to_string(), "clang++".to_string());
+
+        assert_eq!(
+            tool_command_from_environment(&environment, "CC", "cc"),
+            "/usr/bin/clang"
+        );
+        assert_eq!(
+            tool_command_from_environment(&environment, "CXX", "c++"),
+            "clang++"
+        );
+        assert_eq!(
+            tool_command_from_environment(&environment, "AR", "ar"),
+            "ar"
+        );
+    }
+
+    #[test]
+    fn write_mosh_server_build_info_records_reproducibility_metadata() {
+        let tempdir = tempdir().expect("tempdir");
+        let destination = tempdir.path().join("build-info.json");
+        let mut build_environment = std::collections::BTreeMap::new();
+        build_environment.insert("LANG".to_string(), "C".to_string());
+        build_environment.insert("LC_ALL".to_string(), "C".to_string());
+        build_environment.insert("TZ".to_string(), "UTC".to_string());
+        build_environment.insert("ZERO_AR_DATE".to_string(), "1".to_string());
+        build_environment.insert("ARFLAGS".to_string(), "cru".to_string());
+        build_environment.insert("AR".to_string(), "ar".to_string());
+        build_environment.insert("RANLIB".to_string(), "ranlib".to_string());
+        build_environment.insert("PKG_CONFIG".to_string(), "pkg-config".to_string());
+        build_environment.insert("PROTOC".to_string(), "protoc".to_string());
+        build_environment.insert("CC".to_string(), "clang".to_string());
+        build_environment.insert("CXX".to_string(), "clang++".to_string());
+        build_environment.insert("CFLAGS".to_string(), "-O2".to_string());
+        let mut tool_versions = std::collections::BTreeMap::new();
+        tool_versions.insert(
+            "autoconf".to_string(),
+            "autoconf (GNU Autoconf) 2.71".to_string(),
+        );
+        tool_versions.insert("ar".to_string(), "GNU ar (GNU Binutils) 2.42".to_string());
+        tool_versions.insert("cxx".to_string(), "clang version 17.0.6".to_string());
+        tool_versions.insert(
+            "ranlib".to_string(),
+            "GNU ranlib (GNU Binutils) 2.42".to_string(),
+        );
+        tool_versions.insert("pkg-config".to_string(), "1.8.1".to_string());
+        tool_versions.insert("protoc".to_string(), "libprotoc 27.0".to_string());
+        tool_versions.insert("cc".to_string(), "cc (Ubuntu 13.2.0) 13.2.0".to_string());
+
+        write_mosh_server_build_info(
+            &destination,
+            &MoshServerBuildInfo {
+                release_tag: "v1.2.3".to_string(),
+                source_ref: "v1.2.3".to_string(),
+                source_commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                source_commit_unix_ts: 1_701_234_567,
+                source_date_epoch: 1_701_234_567,
+                configure_args: vec![
+                    "--enable-server".to_string(),
+                    "--disable-client".to_string(),
+                ],
+                packaged_binary_sha256:
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                build_environment,
+                tool_versions,
+            },
+        )
+        .expect("write build info");
+
+        let body = fs::read_to_string(&destination).expect("read build info");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("parse build info");
+        assert_eq!(json["release_tag"], "v1.2.3");
+        assert_eq!(json["source"]["ref"], "v1.2.3");
+        assert_eq!(
+            json["source"]["commit"],
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+        assert_eq!(json["source"]["commit_unix_ts"], 1_701_234_567);
+        assert_eq!(json["source"]["source_date_epoch"], 1_701_234_567);
+        assert_eq!(json["configure"]["args"][0], "--enable-server");
+        assert_eq!(json["configure"]["environment"]["LANG"], "C");
+        assert_eq!(json["configure"]["environment"]["LC_ALL"], "C");
+        assert_eq!(json["configure"]["environment"]["TZ"], "UTC");
+        assert_eq!(json["configure"]["environment"]["ZERO_AR_DATE"], "1");
+        assert_eq!(json["configure"]["environment"]["ARFLAGS"], "cru");
+        assert_eq!(json["configure"]["environment"]["AR"], "ar");
+        assert_eq!(json["configure"]["environment"]["RANLIB"], "ranlib");
+        assert_eq!(json["configure"]["environment"]["PKG_CONFIG"], "pkg-config");
+        assert_eq!(json["configure"]["environment"]["PROTOC"], "protoc");
+        assert_eq!(json["configure"]["environment"]["CC"], "clang");
+        assert_eq!(
+            json["packaged_binary_sha256"],
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            json["tool_versions"]["autoconf"],
+            "autoconf (GNU Autoconf) 2.71"
+        );
+        assert_eq!(json["tool_versions"]["cc"], "cc (Ubuntu 13.2.0) 13.2.0");
+        assert_eq!(json["tool_versions"]["cxx"], "clang version 17.0.6");
+        assert_eq!(json["tool_versions"]["ar"], "GNU ar (GNU Binutils) 2.42");
+        assert_eq!(
+            json["tool_versions"]["ranlib"],
+            "GNU ranlib (GNU Binutils) 2.42"
+        );
+        assert_eq!(json["tool_versions"]["pkg-config"], "1.8.1");
+        assert_eq!(json["tool_versions"]["protoc"], "libprotoc 27.0");
+    }
+
+    #[test]
+    fn stage_release_tree_populates_expected_release_layout() {
+        let tempdir = tempdir().expect("tempdir");
+        let root = tempdir.path();
+        let dist_bin = root.join("dist/bin");
+        fs::create_dir_all(&dist_bin).expect("create dist/bin");
+        for (name, contents) in [
+            ("mosh-server-real", b"server-real".as_slice()),
+            ("moshwatchd", b"daemon".as_slice()),
+            ("moshwatch", b"ui".as_slice()),
+        ] {
+            fs::write(dist_bin.join(name), contents).expect("write release binary");
+        }
+
+        fs::create_dir_all(root.join("scripts")).expect("create scripts dir");
+        fs::write(
+            root.join("scripts/mosh-server-wrapper.sh"),
+            "ExecStart=@INSTALL_BIN_DIR@/moshwatchd\n",
+        )
+        .expect("write wrapper template");
+        fs::create_dir_all(root.join("systemd")).expect("create systemd dir");
+        fs::write(
+            root.join("systemd/moshwatchd.service.template"),
+            "ExecStart=@INSTALL_BIN_DIR@/moshwatchd\n",
+        )
+        .expect("write service template");
+
+        fs::write(root.join("README.md"), "readme").expect("write README.md");
+        fs::write(root.join("LICENSE"), "license").expect("write LICENSE");
+        fs::write(root.join("NOTICE"), "notice").expect("write NOTICE");
+        fs::write(root.join("LICENSES.md"), "licenses").expect("write LICENSES.md");
+        fs::create_dir_all(root.join("vendor/mosh")).expect("create vendor/mosh");
+        fs::write(root.join("vendor/mosh/AUTHORS"), "authors").expect("write AUTHORS");
+        fs::write(root.join("vendor/mosh/COPYING"), "copying").expect("write COPYING");
+        fs::write(root.join("vendor/mosh/COPYING.iOS"), "copying-ios").expect("write COPYING.iOS");
+        fs::write(root.join("vendor/mosh/README.md"), "vendor readme")
+            .expect("write vendor README.md");
+
+        let stage_dir = root.join("dist/release/moshwatch-v1.2.3-linux-x86_64");
+        stage_release_tree(root, &stage_dir).expect("stage release tree");
+        validate_release_tree(&stage_dir).expect("validate release tree");
+
+        assert_eq!(
+            fs::read(stage_dir.join("bin/moshwatchd")).expect("read staged daemon"),
+            b"daemon"
+        );
+        assert_eq!(
+            fs::read_to_string(stage_dir.join("templates/mosh-server-wrapper.sh"))
+                .expect("read staged wrapper template"),
+            "ExecStart=@INSTALL_BIN_DIR@/moshwatchd\n"
+        );
+        assert_eq!(
+            fs::read_to_string(stage_dir.join("licenses/vendor-mosh/COPYING"))
+                .expect("read staged COPYING"),
+            "copying"
+        );
+        assert_eq!(
+            fs::read_to_string(stage_dir.join("README.md")).expect("read staged README"),
+            "readme"
+        );
+        assert_eq!(
+            fs::read_to_string(stage_dir.join("install.sh")).expect("read staged installer"),
+            render_release_install_script()
+        );
+        let install_mode = fs::metadata(stage_dir.join("install.sh"))
+            .expect("stat installer")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(install_mode, 0o755);
+    }
+
+    #[test]
+    fn validate_release_tree_rejects_incomplete_layout() {
+        let tempdir = tempdir().expect("tempdir");
+        let stage_dir = tempdir
+            .path()
+            .join("dist/release/moshwatch-v1.2.3-linux-x86_64");
+        fs::create_dir_all(&stage_dir).expect("create stage dir");
+        fs::write(stage_dir.join("install.sh"), "#!/usr/bin/env bash\n").expect("write installer");
+
+        let err = validate_release_tree(&stage_dir).expect_err("validation should fail");
+        assert!(err.to_string().contains("missing release file"));
+    }
+
+    #[test]
+    fn write_sha256_sums_records_basenames_and_digests() {
+        let tempdir = tempdir().expect("tempdir");
+        let first = tempdir.path().join("first.tar.gz");
+        let second = tempdir.path().join("second.tar.gz");
+        fs::write(&first, b"alpha").expect("write first");
+        fs::write(&second, b"beta").expect("write second");
+        let destination = tempdir.path().join("SHA256SUMS");
+
+        write_sha256_sums(&destination, &[&first, &second]).expect("write checksums");
+
+        let body = fs::read_to_string(&destination).expect("read checksums");
+        let expected_first = format!("{}  first.tar.gz\n", sha256_hex(&first).expect("hash"));
+        let expected_second = format!("{}  second.tar.gz\n", sha256_hex(&second).expect("hash"));
+        assert_eq!(body, format!("{expected_first}{expected_second}"));
     }
 }

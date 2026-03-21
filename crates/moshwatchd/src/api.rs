@@ -679,7 +679,10 @@ where
 mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
 
-    use moshwatch_core::{AppConfig, ObserverInfo, TelemetryEvent, TelemetryEventKind};
+    use moshwatch_core::{
+        API_SCHEMA_VERSION, ApiAppConfig, ApiConfigResponse, AppConfig, EventStreamEvent,
+        EventStreamFrame, ObserverInfo, TelemetryEvent, TelemetryEventKind,
+    };
     use tempfile::tempdir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -785,6 +788,20 @@ mod tests {
         serde_json::from_str(body).expect("json body")
     }
 
+    fn strip_generated_at_unix_ms(value: &mut serde_json::Value) {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("generated_at_unix_ms");
+        }
+    }
+
+    fn assert_json_contract_eq(actual: serde_json::Value, expected: serde_json::Value) {
+        let mut actual = actual;
+        let mut expected = expected;
+        strip_generated_at_unix_ms(&mut actual);
+        strip_generated_at_unix_ms(&mut expected);
+        assert_eq!(actual, expected);
+    }
+
     fn sample_event(unix_ms: i64) -> TelemetryEvent {
         TelemetryEvent {
             event: TelemetryEventKind::SessionTick,
@@ -870,6 +887,12 @@ mod tests {
         config.metrics.prometheus.detail_tier = moshwatch_core::MetricsDetailTier::AggregateOnly;
         config.metrics.otlp.enabled = true;
         config.metrics.otlp.endpoint = "http://127.0.0.1:4318/v1/metrics".to_string();
+        let expected = serde_json::to_value(ApiConfigResponse {
+            observer: observer(),
+            generated_at_unix_ms: 0,
+            config: ApiAppConfig::from(&config),
+        })
+        .expect("serialize expected config response");
         let state = Arc::new(RwLock::new(ServiceState::new(config)));
         let snapshots = SnapshotHub::new(observer());
 
@@ -880,12 +903,7 @@ mod tests {
         task.abort();
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let body = json_body(&response);
-        assert_eq!(body["config"]["metrics"]["listen_addr"], "127.0.0.1:2233");
-        assert_eq!(body["config"]["metrics"]["allow_non_loopback"], true);
-        assert_eq!(body["config"]["metrics"]["detail_tier"], "aggregate_only");
-        assert_eq!(body["config"]["metrics"]["otlp"]["enabled"], true);
-        assert!(body["config"]["metrics"].get("prometheus").is_none());
+        assert_json_contract_eq(json_body(&response), expected);
     }
 
     #[tokio::test]
@@ -894,6 +912,12 @@ mod tests {
         let socket_path = tempdir.path().join("api.sock");
         let mut config = AppConfig::default();
         config.metrics.prometheus.listen_addr = None;
+        let expected = serde_json::to_value(ApiConfigResponse {
+            observer: observer(),
+            generated_at_unix_ms: 0,
+            config: ApiAppConfig::from(&config),
+        })
+        .expect("serialize expected config response");
         let state = Arc::new(RwLock::new(ServiceState::new(config)));
         let snapshots = SnapshotHub::new(observer());
 
@@ -904,8 +928,7 @@ mod tests {
         task.abort();
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        let body = json_body(&response);
-        assert!(body["config"]["metrics"]["listen_addr"].is_null());
+        assert_json_contract_eq(json_body(&response), expected);
     }
 
     #[tokio::test]
@@ -1180,13 +1203,23 @@ mod tests {
             .write()
             .await
             .apply_telemetry(session_id.clone(), sample_event(2_000));
-        snapshots.publish_snapshot(
-            state
-                .read()
-                .await
-                .export_summaries(2_000, MAX_EXPORTED_SESSIONS),
-            2_000,
-        );
+        let exported = state
+            .read()
+            .await
+            .export_summaries(2_000, MAX_EXPORTED_SESSIONS);
+        let expected = serde_json::to_value(EventStreamFrame {
+            schema_version: API_SCHEMA_VERSION,
+            observer: observer(),
+            event: EventStreamEvent::Snapshot,
+            sequence: Some(1),
+            generated_at_unix_ms: 2_000,
+            total_sessions: Some(1),
+            truncated_session_count: Some(0),
+            dropped_sessions_total: Some(0),
+            sessions: Some(exported.sessions.clone()),
+        })
+        .expect("serialize expected snapshot frame");
+        snapshots.publish_snapshot(exported, 2_000);
 
         let task = spawn_api(state, snapshots, None, &socket_path).await;
         wait_for_socket(&socket_path).await;
@@ -1227,14 +1260,6 @@ mod tests {
             .expect("stream response should contain headers");
         let first_line = body.lines().next().expect("snapshot line");
         let frame: serde_json::Value = serde_json::from_str(first_line).expect("snapshot frame");
-        assert_eq!(frame["schema_version"], 3);
-        assert_eq!(frame["event"], "snapshot");
-        assert_eq!(frame["observer"]["node_name"], "node-1");
-        assert_eq!(frame["observer"]["system_id"], "system-1");
-        assert_eq!(frame["sessions"][0]["session_id"], session_id);
-        assert_eq!(
-            frame["sessions"][0]["peer"]["current_client_addr"],
-            "192.0.2.1:60001"
-        );
+        assert_eq!(frame, expected);
     }
 }

@@ -751,8 +751,9 @@ curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/moshwatch/api.sock" h
 ```
 
 The same validation set is encoded in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) for CI use when the
-repository is hosted on a compatible platform.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) through a reusable
+validation workflow, and the tagged release workflow reuses that same
+validation before publishing a draft GitHub Release.
 
 ## Repository Layout
 
@@ -781,8 +782,47 @@ If you publish artifacts that include `mosh-server-real`, publish complete
 corresponding source for the exact binaries and preserve both the repository
 license texts and the upstream Mosh notices shipped in `vendor/mosh/`.
 
-Maintainers publish releases manually; there is no automated release pipeline
-from this working tree.
+Tagged `vX.Y.Z` releases are automated through GitHub Actions. Release tags
+must be signed annotated tags that point at the commit being packaged. The
+release workflow builds a draft GitHub Release with:
+
+- `moshwatch-vX.Y.Z-linux-x86_64.tar.gz`
+  Self-contained installable bundle with the built binaries, `install.sh`, the
+  wrapper and service templates, and the top-level license/documentation files.
+- `moshwatch-vX.Y.Z-source.tar.gz`
+  Source archive for the exact tagged commit.
+- `SHA256SUMS`
+  Checksums for the published tarballs.
+- `moshwatch-vX.Y.Z-moshwatchd.cdx.json`
+  CycloneDX dependency SBOM for the Rust daemon binary, generated from the
+  Cargo dependency graph with `cargo-cyclonedx`.
+- `moshwatch-vX.Y.Z-moshwatch-ui.cdx.json`
+  CycloneDX dependency SBOM for the Rust UI binary, generated from the Cargo
+  dependency graph with `cargo-cyclonedx`.
+- `moshwatch-vX.Y.Z-mosh-server-real.cdx.json`
+  CycloneDX SBOM for the packaged vendored `mosh-server-real` binary, generated
+  with Syft. This describes the shipped component and its package contents, not
+  a full source dependency graph.
+- `moshwatch-vX.Y.Z-mosh-server-real-build-info.json`
+  Build-info record for the packaged `mosh-server-real` binary, including the
+  source revision, toolchain metadata, pinned locale/timezone/archive-date
+  behavior, and the `SOURCE_DATE_EPOCH` value used to keep the build path
+  reproducible.
+
+The release workflow also publishes a provenance attestation for the packaged
+`mosh-server-real` binary itself, separate from the tarball-level attestation,
+and records the pinned default tool environment unless the operator overrides
+it.
+
+Maintainers still review and publish the draft release after the workflow
+finishes. GitHub's generated release notes are used, with the checked-in
+release-note configuration and tag range defining what appears in the draft.
+
+To dry-run the same packaging path locally before tagging, run:
+
+```bash
+cargo run --locked -p xtask -- package-release --tag vX.Y.Z
+```
 
 See:
 
