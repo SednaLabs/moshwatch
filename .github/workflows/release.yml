@@ -137,6 +137,17 @@ jobs:
         with:
           subject-path: dist/release/moshwatch-${{ github.ref_name }}-linux-x86_64/bin/mosh-server-real
 
+      - name: Append SBOM hashes to SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist/release
+          sha256sum \
+            "moshwatch-${RELEASE_TAG}-moshwatchd.cdx.json" \
+            "moshwatch-${RELEASE_TAG}-moshwatch-ui.cdx.json" \
+            "moshwatch-${RELEASE_TAG}-mosh-server-real.cdx.json" \
+            >> SHA256SUMS
+
       - name: Upload release assets artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

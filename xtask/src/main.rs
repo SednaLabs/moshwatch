@@ -18,10 +18,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use flate2::{Compression, GzBuilder, write::GzEncoder};
+use flate2::{write::GzEncoder, Compression, GzBuilder};
 use moshwatch_core::{
-    AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy, MetricsDetailTier,
-    metric_catalog,
+    metric_catalog, AppConfig, MetricCardinality, MetricKind, MetricLabelSchema, MetricPrivacy,
+    MetricsDetailTier,
 };
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
@@ -265,6 +265,7 @@ fn package_release(tag: String) -> Result<()> {
         &[
             &artifact_paths.binary_tarball,
             &artifact_paths.source_tarball,
+            &artifact_paths.build_info_json,
         ],
     )?;
 
@@ -1516,7 +1517,7 @@ mod tests {
     use std::{
         cell::Cell,
         fs,
-        os::unix::{fs::PermissionsExt, fs::symlink},
+        os::unix::{fs::symlink, fs::PermissionsExt},
         path::Path,
         thread,
         time::Duration,
@@ -1525,12 +1526,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MoshServerBuildInfo, PATH_BLOCK_END, PATH_BLOCK_START, Placement, install_binary,
-        install_text_file, local_build_source_date_epoch_from, release_artifact_paths,
-        render_release_install_script, render_template, sha256_hex, stage_release_tree,
-        strip_managed_block, tool_command_from_environment, upsert_managed_block,
-        validate_release_tree, vendored_build_environment_from, write_binary_archive,
-        write_mosh_server_build_info, write_sha256_sums,
+        install_binary, install_text_file, local_build_source_date_epoch_from,
+        release_artifact_paths, render_release_install_script, render_template, sha256_hex,
+        stage_release_tree, strip_managed_block, tool_command_from_environment,
+        upsert_managed_block, validate_release_tree, vendored_build_environment_from,
+        write_binary_archive, write_mosh_server_build_info, write_sha256_sums, MoshServerBuildInfo,
+        Placement, PATH_BLOCK_END, PATH_BLOCK_START,
     };
 
     #[test]
@@ -2002,15 +2003,24 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let first = tempdir.path().join("first.tar.gz");
         let second = tempdir.path().join("second.tar.gz");
+        let build_info = tempdir.path().join("build-info.json");
         fs::write(&first, b"alpha").expect("write first");
         fs::write(&second, b"beta").expect("write second");
+        fs::write(&build_info, b"gamma").expect("write build info");
         let destination = tempdir.path().join("SHA256SUMS");
 
-        write_sha256_sums(&destination, &[&first, &second]).expect("write checksums");
+        write_sha256_sums(&destination, &[&first, &second, &build_info]).expect("write checksums");
 
         let body = fs::read_to_string(&destination).expect("read checksums");
         let expected_first = format!("{}  first.tar.gz\n", sha256_hex(&first).expect("hash"));
         let expected_second = format!("{}  second.tar.gz\n", sha256_hex(&second).expect("hash"));
-        assert_eq!(body, format!("{expected_first}{expected_second}"));
+        let expected_build_info = format!(
+            "{}  build-info.json\n",
+            sha256_hex(&build_info).expect("hash")
+        );
+        assert_eq!(
+            body,
+            format!("{expected_first}{expected_second}{expected_build_info}")
+        );
     }
 }
